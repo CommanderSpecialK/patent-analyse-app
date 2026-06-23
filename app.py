@@ -2,9 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import base64
-import time
-import xml.etree.ElementTree as ET
 from sentence_transformers import SentenceTransformer
 
 # Seiteneinstellungen
@@ -18,164 +15,106 @@ def check_password():
         return False
     return st.session_state["password_correct"]
 
-# --- EPA API HILFSFUNKTIONEN ---
-def get_epa_token():
-    key = st.secrets["EPA_CONSUMER_KEY"]
-    secret = st.secrets["EPA_CONSUMER_SECRET"]
-    credential_bytes = f"{key}:{secret}".encode('utf-8')
-    credential_base64 = base64.b64encode(credential_bytes).decode('utf-8')
+# --- OPENALEX API HILFSFUNKTION ---
+def search_openalex_patents(query_string, filter_criterion, score_threshold, model, max_results=100):
+    """Sucht Patente via OpenAlex, holt Texte in einem Rutsch und filtert sie blitzschnell mit der KI."""
+    # OpenAlex API URL für Patente (Typ: 'patent')
+    # Wir suchen in den Titeln und Abstracts nach den eingegebenen Stichwörtern
+    url = f"https://api.openalex.org/works?filter=type:patent,title_and_abstract.search:{query_string}&per_page={max_results}"
     
-    url = "https://ops.epo.org/3.2/auth/accesstoken"
-    headers = {"Authorization": f"Basic {credential_base64}", "Content-Type": "application/x-www-form-urlencoded"}
-    try:
-        response = requests.post(url, headers=headers, data={"grant_type": "client_credentials"})
-        return response.json().get("access_token") if response.status_code == 200 else None
-    except:
-        return None
-
-def fetch_patent_details(country, num, kind, token):
-    """Holt Titel und Abstract (Zusammenfassung) für eine konkrete Patentnummer vom EPA."""
-    url = f"https://ops.epo.org/3.2/rest-services/published-data/publication/epodoc/{country}{num}.{kind}/biblio,abstract"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    title = "Titel nicht verfügbar"
-    abstract = "Zusammenfassung nicht verfügbar"
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            root = ET.fromstring(response.text)
-            
-            # Die offiziellen Namespaces der EPA-Datenbankstrukturen
-            ns = {
-                'exchange': 'http://www.epo.org/exchange',
-                'ops': 'http://ops.epo.org'
-            }
-            
-            # 1. KORREKTUR: Das EPA nutzt 'invention-title' statt 'title'
-            invention_titles = root.findall('.//exchange:invention-title', ns)
-            if invention_titles:
-                title = invention_titles[0].text if invention_titles[0].text else title
-                for t in invention_titles:
-                    # Bevorzuge die englische Übersetzung, falls vorhanden
-                    if t.get('lang') == 'en' and t.text:
-                        title = t.text
-                        break
-                        
-            # 2. Abstract auslesen (Sichere Navigation durch Absätze)
-            abstracts = root.findall('.//exchange:abstract', ns)
-            if abstracts:
-                p_elem = abstracts[0].find('.//exchange:p', ns)
-                if p_elem is not None and p_elem.text:
-                    abstract = p_elem.text
-                for a in abstracts:
-                    if a.get('lang') == 'en':
-                        p_en = a.find('.//exchange:p', ns)
-                        if p_en is not None and p_en.text:
-                            abstract = p_en.text
-                            break
-        return title, abstract
-    except:
-        return title, abstract
-
-def search_epa_and_analyze(query_string, filter_criterion, score_threshold, token, model):
-    """Sucht Patente, holt deren Texte und filtert sie live mit der KI."""
     patents_found = []
-    ns = {'ops': 'http://ops.epo.org', 'exchange': 'http://www.epo.org/exchange'}
     
-    # Abfrage der ersten 50 Treffer (2 Seiten)
-    ranges = ["1-25", "26-50"]
-    raw_numbers = []
-    
-    # SCHRITT 1: Nummern holen
-    for r in ranges:
-        url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q=txt={query_string}"
-        headers = {"Authorization": f"Bearer {token}", "X-OPS-Range": r}
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                root = ET.fromstring(response.text)
-                items_count = 0
-                for doc in root.findall('.//ops:publication-reference', ns):
-                    c = doc.find('.//exchange:country', ns)
-                    n = doc.find('.//exchange:doc-number', ns)
-                    k = doc.find('.//exchange:kind', ns)
-                    if n is not None and n.text:
-                        country = c.text if c is not None else ""
-                        num = n.text
-                        kind = k.text if k is not None else ""
-                        if (country, num, kind) not in raw_numbers:
-                            raw_numbers.append((country, num, kind))
-                            items_count += 1
-                if items_count < 25:
-                    break
-            elif response.status_code == 404:
-                break
-        except:
-            break
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", [])
+            
+            if not results:
+                return []
+                
+            # KI-Vektor für das gewünschte Filter-Kriterium berechnen
+            criterion_embedding = model.encode(filter_criterion, convert_to_numpy=True)
+            
+            # Da OpenAlex alles liefert, brauchen wir keine Zwangspause! Wir loopen direkt durch.
+            for work in results:
+                title = work.get("title", "Kein Titel verfügbar")
+                
+                # OpenAlex speichert Abstracts in einem speziellen Format (Inverted Index). 
+                # Hier rekonstruieren wir den echten Text daraus:
+                abstract_inverted = work.get("abstract_inverted")
+                abstract = "Keine Zusammenfassung verfügbar"
+                if abstract_inverted:
+                    try:
+                        abstract_words = {}
+                        for word, positions in abstract_inverted.items():
+                            for pos in positions:
+                                abstract_words[pos] = word
+                        abstract = " ".join([abstract_words[p] for p in sorted(abstract_words.keys())])
+                    except:
+                        pass
+                
+                # Patentnummer extrahieren (liegt meistens im Feld 'ids' oder 'display_name')
+                # OpenAlex nutzt oft das Format 'Patent: US-123456-A1'
+                display_name = work.get("display_name", "")
+                patent_id = display_name.replace("Patent: ", "") if "Patent:" in display_name else display_name
+                if not patent_id:
+                    # Fallback falls display_name leer ist
+                    patent_id = work.get("id", "").split("/")[-1]
 
-    if not raw_numbers:
+                # Link generieren (OpenAlex bietet oft direkte Links, ansonsten nutzen wir Espacenet als Standard)
+                clean_num_for_link = patent_id.replace("-", "").replace(" ", "")
+                espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={clean_num_for_link}"
+                
+                # --- KI ANALYSE ---
+                patent_text = f"{title} {abstract}"
+                patent_embedding = model.encode(patent_text, convert_to_numpy=True)
+                
+                # Cosinus-Ähnlichkeit berechnen
+                sim = np.dot(criterion_embedding, patent_embedding) / (np.linalg.norm(criterion_embedding) * np.linalg.norm(patent_embedding))
+                percentage_score = round(sim * 100, 1)
+                
+                # Filter anwenden
+                if percentage_score >= score_threshold:
+                    patents_found.append({
+                        "Patentnummer": patent_id,
+                        "Titel": title,
+                        "Zusammenfassung (Abstract)": abstract if len(abstract) < 150 else abstract[:150] + "...",
+                        "KI Relevanz Score": f"{percentage_score} %",
+                        "Link zur Quelle": espacenet_url,
+                        "raw_score": percentage_score
+                    })
+            
+            # Ergebnisse nach Relevanz sortieren
+            if patents_found:
+                df_temp = pd.DataFrame(patents_found)
+                df_temp = df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"])
+                return df_temp.to_dict('records')
+                
+        return []
+    except Exception as e:
+        st.error(f"Fehler bei der OpenAlex-Abfrage: {e}")
         return []
 
-    # SCHRITT 2: Detaildaten abrufen & Vektor-Abgleich starten
-    progress_bar = st.progress(0, text="Analysiere Live-Daten...")
-    total_patents = len(raw_numbers)
-    
-    # Nutzer-Filterbedingung in KI-Vektor umwandeln
-    criterion_embedding = model.encode(filter_criterion, convert_to_numpy=True)
-    
-    for idx, (country, num, kind) in enumerate(raw_numbers):
-        progress_text = f"Hole Details & berechne Relevanz für {country}{num} ({idx+1}/{total_patents})..."
-        progress_bar.progress((idx + 1) / total_patents, text=progress_text)
-        
-        # Live-Titel und Live-Abstract abrufen
-        title, abstract = fetch_patent_details(country, num, kind, token)
-        
-        # Text-Vektorisierung des Patents
-        patent_text = f"{title} {abstract}"
-        patent_embedding = model.encode(patent_text, convert_to_numpy=True)
-        
-        # Cosinus-Ähnlichkeit (Match-Score) ermitteln
-        sim = np.dot(criterion_embedding, patent_embedding) / (np.linalg.norm(criterion_embedding) * np.linalg.norm(patent_embedding))
-        percentage_score = round(sim * 100, 1)
-        
-        if percentage_score >= score_threshold:
-            full_number = f"{country}{num}{kind}"
-            espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={full_number}"
-            
-            patents_found.append({
-                "Patentnummer": full_number,
-                "Titel": title,
-                "Zusammenfassung (Abstract)": abstract if len(abstract) < 130 else abstract[:130] + "...",
-                "KI Relevanz Score": f"{percentage_score} %",
-                "Espacenet Link": espacenet_url,
-                "raw_score": percentage_score
-            })
-            
-        # 0.35s Sicherheits-Pause für die API-Begrenzung des EPA (max 60 Calls/Min)
-        time.sleep(0.35)
-        
-    progress_bar.empty()
-    
-    if patents_found:
-        df_temp = pd.DataFrame(patents_found)
-        df_temp = df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"])
-        return df_temp.to_dict('records')
-    return []
-
-# --- APP RUN ---
+# --- APP START ---
 if check_password():
-    tab_vergleich, tab_suche = st.tabs(["📊 Patent-Listen Vergleich", "🔍 Live-Recherche (EPA & KI-Filter)"])
+    tab_vergleich, tab_suche = st.tabs(["📊 Patent-Listen Vergleich", "🔍 Live-Recherche (OpenAlex Massen-Filter)"])
 
-    # REITER 1 (Listen-Vergleich)
+    # =========================================================================
+    # REITER 1: PATENT-LISTEN VERGLEICH (TEIL 1)
+    # =========================================================================
     with tab_vergleich:
         st.title("💡 Patent Analyse Tool (KI-Berechnung)")
+        st.write("Lade zwei Excel-Listen (.xlsx oder .xlsm) hoch, um sie auf technische Nähe zu prüfen.")
+
         @st.cache_resource
         def load_local_model(): return SentenceTransformer('all-MiniLM-L6-v2')
         model = load_local_model()
+        
         col1, col2 = st.columns(2)
         with col1: uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
         with col2: uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
+        
         def load_patent_data(f):
             if f is not None:
                 df = pd.read_excel(f, engine="openpyxl")
@@ -183,28 +122,32 @@ if check_password():
                 return df.fillna("")
         df_ext = load_patent_data(uploaded_file_ext)
         df_own = load_patent_data(uploaded_file_own)
+
         if df_ext is not None and df_own is not None:
             score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 30, key="slider1")
             if st.button("Semantische Nähe berechnen"):
-                texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                emb_ext = model.encode(texts_ext, convert_to_numpy=True)
-                emb_own = model.encode(texts_own, convert_to_numpy=True)
-                results = []
-                for idx_ext, e_ext in enumerate(emb_ext):
-                    best_score = 0
-                    best_id, best_title = "", ""
-                    for idx_own, e_own in enumerate(emb_own):
-                        sim = np.dot(e_ext, e_own) / (np.linalg.norm(e_ext) * np.linalg.norm(e_own))
-                        if sim > best_score: best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
-                    if round(best_score * 100, 1) >= score_threshold:
-                        results.append({"Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], "Ähnlichstes eigenes Patent": best_id, "Titel (Eigen)": best_title, "Match Score": f"{round(best_score * 100, 1)} %"})
-                if results: st.dataframe(pd.DataFrame(results), use_container_width=True)
+                with st.spinner("Analyse läuft..."):
+                    texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                    texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                    emb_ext = model.encode(texts_ext, convert_to_numpy=True)
+                    emb_own = model.encode(texts_own, convert_to_numpy=True)
+                    results = []
+                    for idx_ext, e_ext in enumerate(emb_ext):
+                        best_score = 0
+                        best_id, best_title = "", ""
+                        for idx_own, e_own in enumerate(emb_own):
+                            sim = np.dot(e_ext, e_own) / (np.linalg.norm(e_ext) * np.linalg.norm(e_own))
+                            if sim > best_score: best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
+                        if round(best_score * 100, 1) >= score_threshold:
+                            results.append({"Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], "Ähnlichstes eigenes Patent": best_id, "Titel (Eigen)": best_title, "Match Score": f"{round(best_score * 100, 1)} %"})
+                    if results: st.dataframe(pd.DataFrame(results), use_container_width=True)
 
-    # REITER 2 (Live-Recherche mit korrigiertem Titel-Parsing)
+    # =========================================================================
+    # REITER 2: LIVE-RECHERCHE (JETZT MIT UNLIMITIERTEM OPENALEX BULK-DOWNLOAD)
+    # =========================================================================
     with tab_suche:
-        st.title("🔍 Live Patent-Recherche & KI-Filterung")
-        st.write("Suche live im EPA und filtere die Ergebnisse sofort nach deinen inhaltlichen Vorgaben.")
+        st.title("🔍 Unlimitierte Live-Recherche & KI-Massenfilter")
+        st.write("Durchsucht Millionen von weltweiten Patenten über OpenAlex in Sekundenschnelle ohne API-Limits.")
 
         @st.cache_resource
         def load_local_model_suche(): return SentenceTransformer('all-MiniLM-L6-v2')
@@ -212,42 +155,47 @@ if check_password():
 
         col_stichworte, col_kriterium = st.columns(2)
         with col_stichworte:
-            st.subheader("1. Grobe EPA-Vorauswahl (Datenbank)")
-            keywords_input = st.text_input("Suchbegriffe für die Datenbank (Englisch, z.B. `battery AND drone`):", value="battery AND drone")
+            st.subheader("1. Datenbank-Abfrage")
+            keywords_input = st.text_input("Grobe Stichworte (Englisch, z.B. `solid state battery`):", value="solid state battery")
         with col_kriterium:
-            st.subheader("2. Feiner KI-Relevanzfilter (Inhalt)")
-            filter_input = st.text_input("Was genau interessiert dich? (Filter-Kriterium, z.B.: `cooling systems`):", value="cooling systems")
+            st.subheader("2. KI-Feinfilter (Freitext)")
+            filter_input = st.text_input("Worauf soll die KI filtern? (z.B. `anode materials or lithium metal silicon`):", value="anode materials")
 
+        # Zusätzliche Einstellungen für die Massen-Analyse
         st.markdown("---")
-        st.subheader("🤖 KI-Filter Einstellungen")
-        live_score_threshold = st.slider("Mindest-Übereinstimmung für Relevanz (in %)", min_value=0, max_value=100, value=25, key="slider2")
-        
-        if st.button("EPA live durchsuchen & mit KI filtern"):
+        col_slider, col_max = st.columns([3, 1])
+        with col_slider:
+            live_score_threshold = st.slider("Mindest-Übereinstimmung für Relevanz (in %)", min_value=0, max_value=100, value=25, key="slider2")
+        with col_max:
+            max_results_input = st.selectbox("Wie viele Patente scannen?", [25, 50, 100, 200], index=2)
+
+        if st.button("Massen-Suche & KI-Analyse starten"):
             if not keywords_input or not filter_input:
                 st.error("Bitte fülle alle Textfelder aus.")
             else:
-                with st.spinner("Frage EPA-Server ab..."):
-                    token = get_epa_token()
-                    if token:
-                        analyzed_results = search_epa_and_analyze(keywords_input, filter_input, live_score_threshold, token, model_suche)
+                with st.spinner(f"Frage OpenAlex ab und jage bis zu {max_results_input} Patente durch die KI..."):
+                    
+                    # Suche und Filterung starten
+                    analyzed_results = search_openalex_patents(keywords_input, filter_input, live_score_threshold, model_suche, max_results=max_results_input)
+                    
+                    if analyzed_results:
+                        st.success(f"Analyse blitzschnell beendet! {len(analyzed_results)} relevante Patente gefunden.")
+                        df_live_analyzed = pd.DataFrame(analyzed_results)
                         
-                        if analyzed_results:
-                            st.success(f"Analyse abgeschlossen! {len(analyzed_results)} Patente gefunden.")
-                            df_live_analyzed = pd.DataFrame(analyzed_results)
-                            
-                            st.data_editor(
-                                df_live_analyzed,
-                                column_config={
-                                    "Espacenet Link": st.column_config.LinkColumn(
-                                        "Link zu Espacenet",
-                                        display_text="↗ In Espacenet öffnen"
-                                    )
-                                },
-                                disabled=True,
-                                use_container_width=True
-                            )
-                            
-                            csv_live = df_live_analyzed.to_csv(index=False).encode('utf-8')
-                            st.download_button(label="Relevante Patente als CSV herunterladen", data=csv_live, file_name="ki_gefilterte_patente.csv", mime="text/csv")
-                        else:
-                            st.warning("Keine Patente erreicht diesen Score-Schwellenwert. Setze den Schieberegler tiefer.")
+                        # Tabelle formatiert anzeigen
+                        st.data_editor(
+                            df_live_analyzed,
+                            column_config={
+                                "Link zur Quelle": st.column_config.LinkColumn(
+                                    "Link zur Quelle",
+                                    display_text="↗ Patent öffnen"
+                                )
+                            },
+                            disabled=True,
+                            use_container_width=True
+                        )
+                        
+                        csv_live = df_live_analyzed.to_csv(index=False).encode('utf-8')
+                        st.download_button(label="Gefilterte Patente als CSV herunterladen", data=csv_live, file_name="openalex_ki_treffer.csv", mime="text/csv")
+                    else:
+                        st.warning("Keine Patente gefunden, die diesen KI-Score erreichen. Verändere deine Suchwörter oder senke den Mindest-Score.")
