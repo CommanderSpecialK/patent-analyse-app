@@ -44,7 +44,7 @@ def get_epa_token():
         return None
 
 def search_epa_keywords(query_string, token):
-    """Sucht nach Stichwörtern in der EPA Datenbank und holt Nummer, Titel und Anmelder."""
+    """Sucht nach Stichwörtern in der EPA Datenbank und holt fehlertolerant alle Daten."""
     url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q=txt={query_string}"
     headers = {"Authorization": f"Bearer {token}"}
     
@@ -53,7 +53,7 @@ def search_epa_keywords(query_string, token):
         if response.status_code == 200:
             root = ET.fromstring(response.text)
             
-            # Namespaces für das XML-Parsing
+            # Alle bekannten Namespaces des EPA registrieren
             ns = {
                 'ops': 'http://ops.epo.org',
                 'exchange': 'http://www.epo.org/exchange',
@@ -62,53 +62,61 @@ def search_epa_keywords(query_string, token):
             
             patents_found = []
             
-            # Wir gehen durch jeden gefundenen Patent-Eintrag (ops:biblio-search)
-            for entry in root.findall('.//ops:biblio-search', ns):
-                # Innerhalb des Eintrags suchen wir die Publikations-Referenz
-                doc = entry.find('.//ops:publication-reference', ns)
-                if doc is not None:
-                    country_elem = doc.find('.//exchange:country', ns)
-                    doc_num_elem = doc.find('.//exchange:doc-number', ns)
-                    kind_elem = doc.find('.//exchange:kind', ns)
-                    
+            # Wir suchen direkt nach allen Publikations-Referenzen im gesamten Dokument
+            # Das stellt sicher, dass wir JEDEN Treffer erwischen, genau wie im allerersten Test!
+            for doc in root.findall('.//ops:publication-reference', ns):
+                country_elem = doc.find('.//exchange:country', ns)
+                doc_num_elem = doc.find('.//exchange:doc-number', ns)
+                kind_elem = doc.find('.//exchange:kind', ns)
+                
+                if doc_num_elem is not None and doc_num_elem.text:
                     country = country_elem.text if country_elem is not None else ""
-                    num = doc_num_elem.text if doc_num_elem is not None else ""
+                    num = doc_num_elem.text
                     kind = kind_elem.text if kind_elem is not None else ""
-                    
                     full_number = f"{country}{num}{kind}"
                     
-                    # --- TITEL EXTRAHIEREN ---
-                    # Das EPA liefert Titel oft in mehreren Sprachen. Wir versuchen zuerst Englisch ('en'), sonst das erste verfügbare
-                    title = "Kein Titel gefunden"
-                    titles = entry.findall('.//exchange:title', ns)
+                    # Standardwerte setzen
+                    title = "Titel im Suchindex nicht verfügbar"
+                    applicant = "Anmelder im Suchindex nicht verfügbar"
+                    
+                    # Jetzt versuchen wir vorsichtig, die Bibliografie-Daten im selben XML-Zweig zu finden
+                    # Da das EPA diese Daten manchmal tiefer verschachtelt, nutzen wir '..' um nach oben zu wandern
+                    parent_entry = doc.makeelement('tmp', {}) # Fallback
+                    # Wir suchen das übergeordnete Element, das den Titel enthält
+                    for entry in root.findall('.//ops:biblio-search', ns):
+                        if entry.find('.//exchange:doc-number', ns) is not None and entry.find('.//exchange:doc-number', ns).text == num:
+                            parent_entry = entry
+                            break
+                    
+                    # Titel auslesen (bevorzugt Englisch)
+                    titles = parent_entry.findall('.//exchange:title', ns)
                     if titles:
-                        title = titles[0].text  # Standard: erster Eintrag
+                        title = titles[0].text if titles[0].text else title
                         for t in titles:
-                            if t.get('lang') == 'en':
+                            if t.get('lang') == 'en' and t.text:
                                 title = t.text
                                 break
                     
-                    # --- ANMELDER (APPLICANT) EXTRAHIEREN ---
-                    applicant = "Unbekannt"
-                    applicants = entry.findall('.//exchange:applicant[@data-format="epodoc"]//exchange:applicant-name//exchange:name', ns)
+                    # Anmelder auslesen
+                    applicants = parent_entry.findall('.//exchange:applicant-name//exchange:name', ns)
+                    if not applicants:
+                        applicants = parent_entry.findall('.//exchange:applicant//exchange:name', ns)
+                    
                     if applicants:
-                        # Alle gefundenen Anmelder mit Komma trennen, falls es mehrere gibt
-                        applicant = ", ".join([a.text for a in applicants if a.text])
-                    elif entry.findall('.//exchange:applicant//exchange:name', ns):
-                        # Fallback falls epodoc Format fehlt
-                        applicant = ", ".join([a.text for a in entry.findall('.//exchange:applicant//exchange:name', ns) if a.text])
-
-                    # Offiziellen Espacenet-Link generieren
-                    # Das Format für Espacenet Links ist meistens: .../publication/COUNTRY+NUMBER+KIND
+                        names = [a.text for a in applicants if a.text]
+                        if names:
+                            applicant = ", ".join(names)
+                    
+                    # Espacenet Link generieren
                     espacenet_url = f"https://worldwide.espacenet.com/publicationDetails/biblio?FT=D&date=&DB=&locale=en_EP&CC={country}&NR={num}&KC={kind}"
                     
-                    if num: # Nur hinzufügen, wenn eine Nummer existiert
-                        patents_found.append({
-                            "Patentnummer": full_number,
-                            "Titel": title,
-                            "Anmelder (Applicant)": applicant,
-                            "Espacenet Link": espacenet_url
-                        })
+                    patents_found.append({
+                        "Patentnummer": full_number,
+                        "Titel": title,
+                        "Anmelder (Applicant)": applicant,
+                        "Espacenet Link": espacenet_url
+                    })
+                    
             return patents_found
         else:
             st.error(f"EPA Suche fehlgeschlagen ({response.status_code}): {response.text}")
