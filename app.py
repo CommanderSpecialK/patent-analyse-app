@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import base64
+import time
 import xml.etree.ElementTree as ET
 from sentence_transformers import SentenceTransformer
 
@@ -32,70 +33,140 @@ def get_epa_token():
     except:
         return None
 
-def search_epa_keywords(query_string, token):
-    """Sucht nach Stichwörtern im EPA und holt über mehrere Seiten bis zu 100 Treffer."""
+def fetch_patent_details(country, num, kind, token):
+    """Holt Titel und Abstract (Zusammenfassung) für eine konkrete Patentnummer vom EPA."""
+    # Wir nutzen den biblio-Endpunkt für Titel und den abstract-Endpunkt für die Zusammenfassung
+    url = f"https://ops.epo.org/3.2/rest-services/published-data/publication/epodoc/{country}{num}.{kind}/biblio,abstract"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    title = "Kein Titel im Index"
+    abstract = "Keine Zusammenfassung im Index"
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            root = ET.fromstring(response.text)
+            ns = {
+                'exchange': 'http://www.epo.org/exchange',
+                'ops': 'http://ops.epo.org'
+            }
+            
+            # 1. Englischen Titel suchen
+            titles = root.findall('.//exchange:title', ns)
+            if titles:
+                title = titles[0].text if titles[0].text else title
+                for t in titles:
+                    if t.get('lang') == 'en' and t.text:
+                        title = t.text
+                        break
+                        
+            # 2. Englischen Abstract suchen
+            abstracts = root.findall('.//exchange:abstract', ns)
+            if abstracts:
+                abstract = abstracts[0].find('.//exchange:p', ns).text if abstracts[0].find('.//exchange:p', ns) is not None else abstract
+                for a in abstracts:
+                    if a.get('lang') == 'en':
+                        p_elem = a.find('.//exchange:p', ns)
+                        if p_elem is not None and p_elem.text:
+                            abstract = p_elem.text
+                            break
+        return title, abstract
+    except:
+        return title, abstract
+
+def search_epa_and_analyze(query_string, filter_criterion, score_threshold, token, model):
+    """Sucht Patente, holt deren Texte und filtert sie live mit der KI."""
     patents_found = []
     ns = {'ops': 'http://ops.epo.org', 'exchange': 'http://www.epo.org/exchange'}
     
-    # Wir fragen 4 Seiten ab (Treffer 1-25, 26-50, 51-75, 76-100)
-    ranges = ["1-25", "26-50", "51-75", "76-100"]
+    # Aus Sicherheitsgründen fragen wir hier erst einmal die ersten 50 Treffer ab (2 Seiten)
+    ranges = ["1-25", "26-50"]
+    raw_numbers = []
     
+    # SCHRITT 1: Nummern holen
     for r in ranges:
-        # Das EPA verlangt die Range im Header oder in der URL
         url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q=txt={query_string}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "X-OPS-Range": r
-        }
-        
+        headers = {"Authorization": f"Bearer {token}", "X-OPS-Range": r}
         try:
             response = requests.get(url, headers=headers)
             if response.status_code == 200:
                 root = ET.fromstring(response.text)
-                
-                page_items = 0
+                items_count = 0
                 for doc in root.findall('.//ops:publication-reference', ns):
-                    country_elem = doc.find('.//exchange:country', ns)
-                    doc_num_elem = doc.find('.//exchange:doc-number', ns)
-                    kind_elem = doc.find('.//exchange:kind', ns)
-                    
-                    if doc_num_elem is not None and doc_num_elem.text:
-                        country = country_elem.text if country_elem is not None else ""
-                        num = doc_num_elem.text
-                        kind = kind_elem.text if kind_elem is not None else ""
-                        full_number = f"{country}{num}{kind}"
-                        
-                        espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={full_number}"
-                        
-                        # Duplikate vermeiden
-                        if not any(p['Patentnummer'] == full_number for p in patents_found):
-                            patents_found.append({
-                                "Patentnummer": full_number,
-                                "Datenbank": "EPA (Espacenet)",
-                                "Espacenet Link": espacenet_url
-                            })
-                            page_items += 1
-                
-                # Wenn eine Seite weniger als 25 Treffer liefert, gibt es keine weiteren Seiten mehr
-                if page_items < 25:
+                    c = doc.find('.//exchange:country', ns)
+                    n = doc.find('.//exchange:doc-number', ns)
+                    k = doc.find('.//exchange:kind', ns)
+                    if n is not None and n.text:
+                        country = c.text if c is not None else ""
+                        num = n.text
+                        kind = k.text if k is not None else ""
+                        if (country, num, kind) not in raw_numbers:
+                            raw_numbers.append((country, num, kind))
+                            items_count += 1
+                if items_count < 25:
                     break
             elif response.status_code == 404:
-                # 404 bedeutet beim EPA oft einfach, dass es für diese Range keine Treffer mehr gibt
                 break
-            else:
-                st.error(f"Fehler bei Reichweite {r}: {response.status_code}")
-                break
-        except Exception as e:
-            st.error(f"Fehler beim Abruf von Seite {r}: {e}")
+        except:
             break
+
+    if not raw_numbers:
+        return []
+
+    # SCHRITT 2: Texte vom EPA abrufen & KI-Abgleich durchführen
+    progress_bar = st.progress(0, text="Rufe Patenttexte ab und starte KI-Filterung...")
+    total_patents = len(raw_numbers)
+    
+    # Das Wunsch-Kriterium des Nutzers vektorisieren
+    criterion_embedding = model.encode(filter_criterion, convert_to_numpy=True)
+    
+    for idx, (country, num, kind) in enumerate(raw_numbers):
+        # Fortschrittsanzeige aktualisieren
+        progress_text = f"Analysiere Patent {idx+1} von {total_patents} ({country}{num})..."
+        progress_bar.progress((idx + 1) / total_patents, text=progress_text)
+        
+        # Detail-Texte (Titel, Abstract) von der API holen
+        title, abstract = fetch_patent_details(country, num, kind, token)
+        
+        # KI-Abgleich: Text des Patents zusammenfügen
+        patent_text = f"{title} {abstract}"
+        patent_embedding = model.encode(patent_text, convert_to_numpy=True)
+        
+        # Cosinus-Ähnlichkeit berechnen
+        sim = np.dot(criterion_embedding, patent_embedding) / (np.linalg.norm(criterion_embedding) * np.linalg.norm(patent_embedding))
+        percentage_score = round(sim * 100, 1)
+        
+        # Nur aufnehmen, wenn der Schwellenwert erreicht wurde
+        if percentage_score >= score_threshold:
+            full_number = f"{country}{num}{kind}"
+            espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={full_number}"
             
-    return patents_found
+            patents_found.append({
+                "Patentnummer": full_number,
+                "Titel": title,
+                "Zusammenfassung (Abstract)": abstract if len(abstract) < 150 else abstract[:150] + "...",
+                "KI Relevanz Score": f"{percentage_score} %",
+                "Espacenet Link": espacenet_url,
+                "raw_score": percentage_score  # Für die Sortierung
+            })
+            
+        # Eine winzige Pause einbauen, um das API-Limit des EPA (max 60/min) absolut sicher einzuhalten
+        time.sleep(0.3)
+        
+    progress_bar.empty()
+    
+    # Nach Relevanz sortieren
+    if patents_found:
+        df_temp = pd.DataFrame(patents_found)
+        df_temp = df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"])
+        return df_temp.to_dict('records')
+    return []
 
 # --- APP STARTEN ---
 if check_password():
-    tab_vergleich, tab_suche = st.tabs(["📊 Patent-Listen Vergleich", "🔍 Live-Recherche (EPA & Web)"])
+    tab_vergleich, tab_suche = st.tabs(["📊 Patent-Listen Vergleich", "🔍 Live-Recherche (EPA & KI-Filter)"])
 
-    # REITER 1 (Hier bleibt alles wie gehabt)
+    # REITER 1 (Listen-Vergleich)
     with tab_vergleich:
         st.title("💡 Patent Analyse Tool (KI-Berechnung)")
         @st.cache_resource
@@ -104,7 +175,6 @@ if check_password():
         col1, col2 = st.columns(2)
         with col1: uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
         with col2: uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
-        
         def load_patent_data(f):
             if f is not None:
                 df = pd.read_excel(f, engine="openpyxl")
@@ -112,9 +182,8 @@ if check_password():
                 return df.fillna("")
         df_ext = load_patent_data(uploaded_file_ext)
         df_own = load_patent_data(uploaded_file_own)
-
         if df_ext is not None and df_own is not None:
-            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 30)
+            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 30, key="slider1")
             if st.button("Semantische Nähe berechnen"):
                 texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
                 texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
@@ -126,51 +195,67 @@ if check_password():
                     best_id, best_title = "", ""
                     for idx_own, e_own in enumerate(emb_own):
                         sim = np.dot(e_ext, e_own) / (np.linalg.norm(e_ext) * np.linalg.norm(e_own))
-                        if sim > best_score:
-                            best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
+                        if sim > best_score: best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
                     if round(best_score * 100, 1) >= score_threshold:
                         results.append({"Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], "Ähnlichstes eigenes Patent": best_id, "Titel (Eigen)": best_title, "Match Score": f"{round(best_score * 100, 1)} %"})
                 if results: st.dataframe(pd.DataFrame(results), use_container_width=True)
 
-    # REITER 2 (Erweitert um Multi-Such-Logik und Paginierung)
+    # REITER 2 (Live-Recherche MIT NEUEM KI-FILTER UND FREITEXT)
     with tab_suche:
-        st.title("🔍 Live Patent-Recherche & Stand der Technik")
-        search_type = st.radio("Wonach möchtest du suchen?", ["Patentnummer eingeben", "Stichwörter (Stand der Technik)"])
+        st.title("🔍 Live Patent-Recherche & KI-Filterung")
+        st.write("Suche live im EPA und filtere die Ergebnisse sofort nach deinen inhaltlichen Vorgaben.")
 
-        if search_type == "Patentnummer eingeben":
-            st.subheader("Ähnliche Patente zu einer Nummer finden")
-            patent_input = st.text_input("Patentnummer eingeben (z.B. EP3000000):")
-            if st.button("Ähnliche Patente suchen"):
-                if patent_input:
-                    direct_url = f"https://worldwide.espacenet.com/patent/search?q={patent_input}"
-                    st.markdown(f"👉 [Klicke hier, um das Patent direkt auf Espacenet zu prüfen]({direct_url})")
-        else:
-            st.subheader("Stand der Technik über Stichwörter ermitteln")
+        # Das KI-Modell auch hier bereitstellen
+        @st.cache_resource
+        def load_local_model_suche(): return SentenceTransformer('all-MiniLM-L6-v2')
+        model_suche = load_local_model_suche()
+
+        # Such-Eingaben
+        col_stichworte, col_kriterium = st.columns(2)
+        
+        with col_stichworte:
+            st.subheader("1. Grobe EPA-Vorauswahl (Datenbank)")
+            keywords_input = st.text_input("Suchbegriffe für die Datenbank (Englisch, z.B. `battery AND drone`):", value="battery AND drone")
             
-            # Info-Box für den Nutzer, wie man präzise sucht
-            st.info("""
-            💡 **Tipps für eine präzise Suche mit mehreren Begriffen:**
-            * Nutzen Sie **`AND`** (Großbuchstaben), um Begriffe zu verknüpfen: z.B. `battery AND lithium AND drone`
-            * Nutzen Sie **`OR`**, wenn alternative Begriffe erlaubt sind: z.B. `drone OR 'unmanned aerial vehicle'`
-            * Nutzen Sie einfache Anführungszeichen **`'`** für exakte Wortgruppen: z.B. `'solid state battery'`
-            """)
-            
-            keywords_input = st.text_input("Suchbegriffe eingeben (Englisch erforderlich):", value="battery AND lithium")
-            
-            if st.button("EPA Datenbank live durchsuchen"):
-                if not keywords_input:
-                    st.error("Bitte gib Suchbegriffe ein.")
-                else:
-                    with st.spinner("Frage EPA-Datenbank ab (holt bis zu 100 Treffer)..."):
-                        token = get_epa_token()
-                        if token:
-                            results = search_epa_keywords(keywords_input, token)
-                            if results:
-                                st.success(f"Erfolgreich {len(results)} Patente beim EPA gefunden (max. 100 voreingestellt)!")
-                                df_live = pd.DataFrame(results)
-                                st.data_editor(df_live, column_config={"Espacenet Link": st.column_config.LinkColumn("Link zu Espacenet", display_text="↗ In Espacenet öffnen")}, disabled=True, use_container_width=True)
-                                
-                                csv_live = df_live.to_csv(index=False).encode('utf-8')
-                                st.download_button(label="Suchergebnisse als CSV herunterladen", data=csv_live, file_name="epa_suchergebnisse.csv", mime="text/csv")
-                            else:
-                                st.warning("Keine Treffer gefunden. Überprüfe die Schreibweise oder vereinfache die Schlagwörter.")
+        with col_kriterium:
+            st.subheader("2. Feiner KI-Relevanzfilter (Inhalt)")
+            filter_input = st.text_input("Was genau interessiert dich an diesen Patenten? (Filter-Kriterium, z.B.: `cooling systems or heat management`):", value="cooling systems or heat management")
+
+        st.markdown("---")
+        st.subheader("🤖 KI-Filter Einstellungen")
+        live_score_threshold = st.slider("Mindest-Übereinstimmung für Relevanz (in %)", min_value=0, max_value=100, value=25, key="slider2")
+        
+        if st.button("EPA live durchsuchen & mit KI filtern"):
+            if not keywords_input or not filter_input:
+                st.error("Bitte fülle sowohl die Suchbegriffe als auch das KI-Filter-Kriterium aus.")
+            else:
+                with st.spinner("Melde beim Europäischen Patentamt an..."):
+                    token = get_epa_token()
+                    
+                    if token:
+                        # Aufruf der kombinierten Suche, Abruf- und Analyselogik
+                        analyzed_results = search_epa_and_analyze(keywords_input, filter_input, live_score_threshold, token, model_suche)
+                        
+                        if analyzed_results:
+                            st.success(f"Analyse abgeschlossen! {len(analyzed_results)} Patente erfüllen dein KI-Relevanzkriterium von >= {live_score_threshold}%.")
+                            
+                            df_live_analyzed = pd.DataFrame(analyzed_results)
+                            
+                            # Tabelle perfekt formatiert ausgeben
+                            st.data_editor(
+                                df_live_analyzed,
+                                column_config={
+                                    "Espacenet Link": st.column_config.LinkColumn(
+                                        "Link zu Espacenet",
+                                        display_text="↗ In Espacenet öffnen"
+                                    )
+                                },
+                                disabled=True,
+                                use_container_width=True
+                            )
+                            
+                            # Export-Möglichkeit der vorsortierten Liste
+                            csv_live = df_live_analyzed.to_csv(index=False).encode('utf-8')
+                            st.download_button(label="Relevante Patente als CSV herunterladen", data=csv_live, file_name="ki_gefilterte_patente.csv", mime="text/csv")
+                        else:
+                            st.warning("Keine Patente gefunden, die das Relevanz-Kriterium bei diesem Prozentwert erreichen. Drehe den Mindest-Score etwas nach unten oder passe das Kriterium an.")
