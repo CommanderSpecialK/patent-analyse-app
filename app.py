@@ -17,10 +17,12 @@ def check_password():
 
 # --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, model, max_results=100):
-    """Sucht Patente via OpenAlex, holt Texte in einem Rutsch und filtert sie blitzschnell mit der KI."""
-    # OpenAlex API URL für Patente (Typ: 'patent')
-    # Wir suchen in den Titeln und Abstracts nach den eingegebenen Stichwörtern
-    url = f"https://api.openalex.org/works?filter=type:patent,title_and_abstract.search:{query_string}&per_page={max_results}"
+    """Sucht Patente via OpenAlex (robuste Version) und jagt sie durch die KI."""
+    # Bereinigung der Suchbegriffe für die URL
+    clean_query = query_string.replace(" AND ", " ").replace(" OR ", " ").replace("'", "")
+    
+    # Der offizielle und sichere Such-Endpunkt von OpenAlex (gefiltert auf Typ: patent)
+    url = f"https://api.openalex.org/works?search={clean_query}&filter=type:patent&per_page={max_results}"
     
     patents_found = []
     
@@ -36,45 +38,48 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, mod
             # KI-Vektor für das gewünschte Filter-Kriterium berechnen
             criterion_embedding = model.encode(filter_criterion, convert_to_numpy=True)
             
-            # Da OpenAlex alles liefert, brauchen wir keine Zwangspause! Wir loopen direkt durch.
             for work in results:
-                title = work.get("title", "Kein Titel verfügbar")
+                title = work.get("title")
+                if not title:
+                    title = "Kein Titel verfügbar"
                 
-                # OpenAlex speichert Abstracts in einem speziellen Format (Inverted Index). 
-                # Hier rekonstruieren wir den echten Text daraus:
-                abstract_inverted = work.get("abstract_inverted")
+                # Extrem fehlertolerante Rekonstruktion des Abstracts
                 abstract = "Keine Zusammenfassung verfügbar"
-                if abstract_inverted:
+                abstract_inverted = work.get("abstract_inverted")
+                if abstract_inverted and isinstance(abstract_inverted, dict):
                     try:
                         abstract_words = {}
                         for word, positions in abstract_inverted.items():
-                            for pos in positions:
-                                abstract_words[pos] = word
-                        abstract = " ".join([abstract_words[p] for p in sorted(abstract_words.keys())])
+                            if positions and isinstance(positions, list):
+                                for pos in positions:
+                                    abstract_words[pos] = word
+                        if abstract_words:
+                            abstract = " ".join([abstract_words[p] for p in sorted(abstract_words.keys())])
                     except:
-                        pass
+                        abstract = "Zusammenfassung konnte nicht decodiert werden"
                 
-                # Patentnummer extrahieren (liegt meistens im Feld 'ids' oder 'display_name')
-                # OpenAlex nutzt oft das Format 'Patent: US-123456-A1'
+                # Patentnummer ermitteln
                 display_name = work.get("display_name", "")
-                patent_id = display_name.replace("Patent: ", "") if "Patent:" in display_name else display_name
-                if not patent_id:
-                    # Fallback falls display_name leer ist
+                patent_id = "Unbekannte Nummer"
+                if display_name:
+                    patent_id = display_name.replace("Patent: ", "")
+                else:
                     patent_id = work.get("id", "").split("/")[-1]
 
-                # Link generieren (OpenAlex bietet oft direkte Links, ansonsten nutzen wir Espacenet als Standard)
-                clean_num_for_link = patent_id.replace("-", "").replace(" ", "")
+                # Link zu Espacenet aufbauen
+                clean_num_for_link = patent_id.replace("-", "").replace(" ", "").replace("_", "")
                 espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={clean_num_for_link}"
                 
                 # --- KI ANALYSE ---
-                patent_text = f"{title} {abstract}"
+                # Falls Abstract fehlt, nutzen wir nur den Titel, damit der Treffer nicht verloren geht!
+                patent_text = f"{title}. {abstract}"
                 patent_embedding = model.encode(patent_text, convert_to_numpy=True)
                 
                 # Cosinus-Ähnlichkeit berechnen
                 sim = np.dot(criterion_embedding, patent_embedding) / (np.linalg.norm(criterion_embedding) * np.linalg.norm(patent_embedding))
                 percentage_score = round(sim * 100, 1)
                 
-                # Filter anwenden
+                # In die Liste aufnehmen
                 if percentage_score >= score_threshold:
                     patents_found.append({
                         "Patentnummer": patent_id,
@@ -85,7 +90,7 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, mod
                         "raw_score": percentage_score
                     })
             
-            # Ergebnisse nach Relevanz sortieren
+            # Sortieren nach Relevanz
             if patents_found:
                 df_temp = pd.DataFrame(patents_found)
                 df_temp = df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"])
