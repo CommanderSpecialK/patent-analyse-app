@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import base64
-import xml.etree.ElementTree as ET  # Das EPA sendet Daten im XML-Format, das wir damit lesen
-from sentence_transformers import SentenceTransformer
+import xml.etree.ElementTree as ET
 
 # Seiteneinstellungen
 st.set_page_config(page_title="Patent Analyse Tool", layout="wide")
@@ -23,7 +22,6 @@ def get_epa_token():
     key = st.secrets["EPA_CONSUMER_KEY"]
     secret = st.secrets["EPA_CONSUMER_SECRET"]
     
-    # Schlüssel müssen für das EPA in Base64 codiert werden
     credential_bytes = f"{key}:{secret}".encode('utf-8')
     credential_base64 = base64.b64encode(credential_bytes).decode('utf-8')
     
@@ -46,18 +44,16 @@ def get_epa_token():
         return None
 
 def search_epa_keywords(query_string, token):
-    """Sucht nach Stichwörtern in der EPA Datenbank (Espacenet)."""
-    # CQL ist die Suchsprache des EPA. txt=Sucht in Titel/Abstract
+    """Sucht nach Stichwörtern in der EPA Datenbank und holt Nummer, Titel und Anmelder."""
     url = f"https://ops.epo.org/3.2/rest-services/published-data/search?q=txt={query_string}"
     headers = {"Authorization": f"Bearer {token}"}
     
     try:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
-            # Das EPA antwortet in XML. Wir extrahieren die wichtigsten Daten:
             root = ET.fromstring(response.text)
             
-            # Namespaces, die das EPA im XML nutzt
+            # Namespaces für das XML-Parsing
             ns = {
                 'ops': 'http://ops.epo.org',
                 'exchange': 'http://www.epo.org/exchange',
@@ -66,22 +62,53 @@ def search_epa_keywords(query_string, token):
             
             patents_found = []
             
-            # Wir schleifen durch alle gefundenen Dokumente (maximal 25 Ergebnisse standardmäßig)
-            for doc in root.findall('.//ops:publication-reference', ns):
-                doc_num_elem = doc.find('.//exchange:doc-number', ns)
-                country_elem = doc.find('.//exchange:country', ns)
-                kind_elem = doc.find('.//exchange:kind', ns)
-                
-                if doc_num_elem is not None:
+            # Wir gehen durch jeden gefundenen Patent-Eintrag (ops:biblio-search)
+            for entry in root.findall('.//ops:biblio-search', ns):
+                # Innerhalb des Eintrags suchen wir die Publikations-Referenz
+                doc = entry.find('.//ops:publication-reference', ns)
+                if doc is not None:
+                    country_elem = doc.find('.//exchange:country', ns)
+                    doc_num_elem = doc.find('.//exchange:doc-number', ns)
+                    kind_elem = doc.find('.//exchange:kind', ns)
+                    
                     country = country_elem.text if country_elem is not None else ""
-                    num = doc_num_elem.text
+                    num = doc_num_elem.text if doc_num_elem is not None else ""
                     kind = kind_elem.text if kind_elem is not None else ""
                     
                     full_number = f"{country}{num}{kind}"
-                    patents_found.append({
-                        "Patentnummer": full_number,
-                        "Datenbank": "EPA (Espacenet)"
-                    })
+                    
+                    # --- TITEL EXTRAHIEREN ---
+                    # Das EPA liefert Titel oft in mehreren Sprachen. Wir versuchen zuerst Englisch ('en'), sonst das erste verfügbare
+                    title = "Kein Titel gefunden"
+                    titles = entry.findall('.//exchange:title', ns)
+                    if titles:
+                        title = titles[0].text  # Standard: erster Eintrag
+                        for t in titles:
+                            if t.get('lang') == 'en':
+                                title = t.text
+                                break
+                    
+                    # --- ANMELDER (APPLICANT) EXTRAHIEREN ---
+                    applicant = "Unbekannt"
+                    applicants = entry.findall('.//exchange:applicant[@data-format="epodoc"]//exchange:applicant-name//exchange:name', ns)
+                    if applicants:
+                        # Alle gefundenen Anmelder mit Komma trennen, falls es mehrere gibt
+                        applicant = ", ".join([a.text for a in applicants if a.text])
+                    elif entry.findall('.//exchange:applicant//exchange:name', ns):
+                        # Fallback falls epodoc Format fehlt
+                        applicant = ", ".join([a.text for a in entry.findall('.//exchange:applicant//exchange:name', ns) if a.text])
+
+                    # Offiziellen Espacenet-Link generieren
+                    # Das Format für Espacenet Links ist meistens: .../publication/COUNTRY+NUMBER+KIND
+                    espacenet_url = f"https://worldwide.espacenet.com/publicationDetails/biblio?FT=D&date=&DB=&locale=en_EP&CC={country}&NR={num}&KC={kind}"
+                    
+                    if num: # Nur hinzufügen, wenn eine Nummer existiert
+                        patents_found.append({
+                            "Patentnummer": full_number,
+                            "Titel": title,
+                            "Anmelder (Applicant)": applicant,
+                            "Espacenet Link": espacenet_url
+                        })
             return patents_found
         else:
             st.error(f"EPA Suche fehlgeschlagen ({response.status_code}): {response.text}")
@@ -169,7 +196,7 @@ if check_password():
                         st.dataframe(df_results, use_container_width=True)
 
     # =========================================================================
-    # REITER 2: LIVE-RECHERCHE (TEIL 2 - JETZT AKTIV!)
+    # REITER 2: LIVE-RECHERCHE (TEIL 2)
     # =========================================================================
     with tab_suche:
         st.title("🔍 Live Patent-Recherche & Stand der Technik")
@@ -182,11 +209,10 @@ if check_password():
             patent_input = st.text_input("Patentnummer eingeben (z.B. RE47539 oder 3000000):")
             
             if st.button("Ähnliche Patente suchen"):
-                st.info("Funktion folgt im nächsten Teilschritt – wir testen zuerst die Stichwortsuche!")
+                st.info("Funktion folgt im nächsten Teilschritt – wir testen zuerst die erweiterte Stichwortsuche!")
 
         else:
             st.subheader("Stand der Technik über Stichwörter ermitteln")
-            # Wichtig: Die EPA API versteht am besten englische Begriffe in einfachen Anführungszeichen
             keywords_input = st.text_input("Stichwörter eingeben (Verwende einfache Anführungszeichen für Wortgruppen, z.B. 'solid state battery'):")
             
             if st.button("EPA Datenbank live durchsuchen"):
@@ -194,18 +220,28 @@ if check_password():
                     st.error("Bitte gib Suchbegriffe ein.")
                 else:
                     with st.spinner("Verbinde mit dem Europäischen Patentamt..."):
-                        # 1. Token holen
                         token = get_epa_token()
                         
                         if token:
-                            st.write("🔄 Authentifizierung erfolgreich. Starte Live-Abfrage...")
-                            # 2. Suchen
+                            st.write("🔄 Authentifizierung erfolgreich. Rufe Daten ab...")
                             results = search_epa_keywords(keywords_input, token)
                             
-                            # 3. Ergebnisse anzeigen
                             if results:
                                 st.success(f"Erfolgreich {len(results)} Patente beim EPA gefunden!")
                                 df_live = pd.DataFrame(results)
-                                st.dataframe(df_live, use_container_width=True)
+                                
+                                # Hier tricksen wir: Wir stellen die Tabelle so dar, dass die "Espacenet Link" Spalte klickbar wird
+                                st.data_editor(
+                                    df_live,
+                                    column_config={
+                                        "Espacenet Link": st.column_config.LinkColumn(
+                                            "Link zu Espacenet",
+                                            help="Öffnet das Patent direkt im offiziellen Register",
+                                            display_text="↗ Auf Espacenet ansehen"
+                                        )
+                                    },
+                                    disabled=True, # Verhindert, dass der Nutzer die Tabelle editiert
+                                    use_container_width=True
+                                )
                             else:
-                                st.warning("Keine direkten Treffer gefunden. Versuche ein anderes, einzelnes englisches Stichwort (z.B. 'battery' oder 'sensor').")
+                                st.warning("Keine Treffer gefunden. Versuche ein anderes, englisches Stichwort.")
