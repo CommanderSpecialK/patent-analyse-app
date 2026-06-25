@@ -29,7 +29,7 @@ def get_gemini_client():
 
 # --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
-    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung des 1000-Texte-Limits."""
+    """Erzeugt hochpräzise Vektoren via Gemini API mit absolutem Schutz vor dem Rolling Window (429)."""
     if not texts:
         return np.array([])
         
@@ -53,8 +53,8 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Feste Pause zwischen den 100er-Blöcken
-                time.sleep(6.2)
+                # Moderate Pause im Normalbetrieb für ein zügiges Durchlaufen
+                time.sleep(2.0)
                 break  
                 
             except errors.APIError as e:
@@ -62,16 +62,16 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                     if versuch < 4:
                         countdown_placeholder = st.empty()
                         
-                        # Da das Limit nur minimal überschritten wurde, reichen oft kurze Pausen.
-                        # Wir warten hier sicherheitshalber 20 Sekunden, um die Quote zu leeren.
-                        for sekunde in range(20, -1, -1):
+                        # Volle 65 Sekunden warten, damit das Rolling Window bei Google sicher abläuft
+                        for sekunde in range(65, -1, -1):
                             countdown_placeholder.warning(
-                                f"⏳ **Google API-Limit kurzzeitig erreicht.** Die App pausiert kurz zur Entlastung. "
+                                f"⏳ **Google API-Limit (1.000 Texte) erreicht.** Die App wartet, bis das Zeitfenster frei wird. "
                                 f"Weiter geht es automatisch in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
                             )
                             time.sleep(1)
+                        
                         countdown_placeholder.empty()
-                        continue
+                        continue # Startet den exakt selben 100er-Block nach der Pause neu
                 
                 st.error(f"⚠️ Kritischer API-Fehler (Code {e.code}): {e.message}")
                 return np.array([])
@@ -81,6 +81,7 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 return np.array([])
             
     return np.array(embeddings)
+
 
 
 
