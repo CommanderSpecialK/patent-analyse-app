@@ -53,26 +53,23 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Feste Pause nach jedem Block
-                time.sleep(1.2)
+                # Erhöht auf 3.5 Sekunden, um unter dem Limit von 1.000 Texten/Minute zu bleiben
+                time.sleep(3.5)
                 break  
                 
             except errors.APIError as e:
-                # Fängt das 429-Limit exakt ab
                 if e.code == 429:
                     if versuch < 4:
-                        # Erstellt einen Platzhalter in Streamlit für den Live-Countdown
                         countdown_placeholder = st.empty()
                         
-                        # Zählt von 50 Sekunden bis 0 rückwärts
-                        for sekunde in range(50, -1, -1):
+                        # Erhöht auf 65 Sekunden, damit das Rolling Window bei Google sicher abläuft
+                        for sekunde in range(65, -1, -1):
                             countdown_placeholder.warning(
-                                f"⏳ **Google API-Limit erreicht.** Die App entlastet die Schnittstelle. "
+                                f"⏳ **Google API-Limit (1.000 Texte/Min) erreicht.** Die App pausiert kurz zur Entlastung. "
                                 f"Weiter geht es automatisch in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
                             )
                             time.sleep(1)
                         
-                        # Löscht die Warnmeldung nach Ablauf des Countdowns
                         countdown_placeholder.empty()
                         continue
                 
@@ -84,6 +81,7 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 return np.array([])
             
     return np.array(embeddings)
+
 
 # --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
