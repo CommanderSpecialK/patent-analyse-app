@@ -16,8 +16,17 @@ def check_password():
         return False
     return st.session_state["password_correct"]
 
-# --- GEMINI CLIENT & EMBEDDING INITIALISIERUNG ---
-@st.cache_resource
+# --- GEMINI CLIENT INITIALISIERUNG ---
+def get_gemini_client():
+    """Holt den Key explizit aus Streamlit Secrets und initialisiert den Client."""
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error("❌ Der GEMINI_API_KEY fehlt in den Streamlit Secrets!")
+        return None
+    
+    api_key = st.secrets["GEMINI_API_KEY"].strip().strip('"').strip("'")
+    return genai.Client(api_key=api_key)
+
+# --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
     """Erzeugt hochpräzise Vektoren via Gemini API in Batches."""
     if not texts:
@@ -35,7 +44,7 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         batch_texts = [str(t).strip() if str(t).strip() != "" else "Kein Text vorhanden" for t in batch_texts]
         
         try:
-            # Nutzt jetzt das korrekte, aktive gemini-embedding-001 Modell
+            # Nutzt das korrekte, aktive gemini-embedding-001 Modell
             response = client.models.embed_content(
                 model=model_name,
                 contents=batch_texts
@@ -48,27 +57,6 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
             
     return np.array(embeddings)
 
-        
-    embeddings = []
-    batch_size = 100 
-    
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i + batch_size]
-        batch_texts = [str(t).strip() if str(t).strip() != "" else "Kein Text vorhanden" for t in batch_texts]
-        
-        try:
-            # Erzwinge den Aufruf mit den richtigen Authentifizierungs-Spezifikationen für AQ-Keys
-            response = client.models.embed_content(
-                model=model_name,
-                contents=batch_texts
-            )
-            for embedding in response.embeddings:
-                embeddings.append(embedding.values)
-        except Exception as e:
-            st.error(f"⚠️ Fehler bei der Gemini-API-Abfrage. Bitte prüfe, ob dein Projekt im Google AI Studio aktiv ist. Details: {e}")
-            return np.array([])
-            
-    return np.array(embeddings)
 
 
 # --- OPENALEX API HILFSFUNKTION (Aktualisiert auf Gemini) ---
