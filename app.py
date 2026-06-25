@@ -5,6 +5,7 @@ import requests
 import time
 from google import genai
 from google.genai import types
+from google.genai import errors
 
 # Seiteneinstellungen
 st.set_page_config(page_title="Patent Analyse Tool", layout="wide")
@@ -18,18 +19,8 @@ def check_password():
     return st.session_state["password_correct"]
 
 # --- GEMINI CLIENT INITIALISIERUNG ---
-def get_gemini_client():
-    """Holt den Key explizit aus Streamlit Secrets und initialisiert den Client."""
-    if "GEMINI_API_KEY" not in st.secrets:
-        st.error("❌ Der GEMINI_API_KEY fehlt in den Streamlit Secrets!")
-        return None
-    
-    api_key = st.secrets["GEMINI_API_KEY"].strip().strip('"').strip("'")
-    return genai.Client(api_key=api_key)
-
-# --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
-    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung aller API-Limits."""
+    """Erzeugt hochpräzise Vektoren via Gemini API mit robustem Quoten-Schutz und Live-Countdown."""
     if not texts:
         return np.array([])
         
@@ -38,14 +29,13 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         return np.array([])
         
     embeddings = []
-    # Strikt auf 100 gesetzt, da Google exakt maximal 100 Texte pro Anfrage erlaubt
     batch_size = 100 
     
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
         batch_texts = [str(t).strip() if str(t).strip() != "" else "Kein Text vorhanden" for t in batch_texts]
         
-        for versuch in range(3):
+        for versuch in range(5):
             try:
                 response = client.models.embed_content(
                     model=model_name,
@@ -54,23 +44,38 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Feste Pause von 1,2 Sekunden nach jedem 100er-Block. 
-                # Das verhindert, dass wir die 100 Anfragen pro Minute im Free Tier reißen.
+                # Feste Pause nach jedem Block
                 time.sleep(1.2)
                 break  
                 
-            except Exception as e:
-                # Automatisches Sicherheitsnetz für das 429-Minuten-Limit
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    if versuch < 2:
-                        st.warning(f"⏳ Minuten-Limit fast erreicht. Warte 20 Sekunden zur Entlastung (Versuch {versuch+1}/3)...")
-                        time.sleep(20)
+            except errors.APIError as e:
+                # Fängt das 429-Limit exakt ab
+                if e.code == 429:
+                    if versuch < 4:
+                        # Erstellt einen Platzhalter in Streamlit für den Live-Countdown
+                        countdown_placeholder = st.empty()
+                        
+                        # Zählt von 50 Sekunden bis 0 rückwärts
+                        for sekunde in range(50, -1, -1):
+                            countdown_placeholder.warning(
+                                f"⏳ **Google API-Limit erreicht.** Die App entlastet die Schnittstelle. "
+                                f"Weiter geht es automatisch in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
+                            )
+                            time.sleep(1)
+                        
+                        # Löscht die Warnmeldung nach Ablauf des Countdowns
+                        countdown_placeholder.empty()
                         continue
                 
-                st.error(f"⚠️ Kritischer Fehler bei der Gemini-API-Abfrage: {e}")
+                st.error(f"⚠️ Kritischer API-Fehler (Code {e.code}): {e.message}")
+                return np.array([])
+                
+            except Exception as e:
+                st.error(f"⚠️ Unerwarteter Fehler bei der Gemini-API-Abfrage: {e}")
                 return np.array([])
             
     return np.array(embeddings)
+
 
 
 
