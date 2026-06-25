@@ -27,6 +27,7 @@ def get_gemini_client():
 
 # --- GEMINI EMBEDDING BERECHNUNG (Strikt mathematisch gedrosselt) ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
+    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung des 1000-Texte-Limits."""
     if not texts:
         return np.array([])
         
@@ -35,8 +36,8 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         return np.array([])
         
     embeddings = []
-    # 50 Texte pro Paket
-    batch_size = 50 
+    # Auf 10 reduziert, um die Last perfekt über die Zeit zu strecken
+    batch_size = 10 
     
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
@@ -51,30 +52,32 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # 3,5 Sekunden Pause nach 50 Texten = ca. 850 Texte/Minute.
-                # Damit bleiben wir mathematisch IMMER unter dem 1.000er-Limit!
-                time.sleep(3.5)
+                # Feste Pause von 1,5 Sekunden nach 10 Texten = Konstant max. 400 Texte/Minute.
+                # Das reißt das Google-Limit (1.000) mathematisch garantiert niemals!
+                time.sleep(1.5)
                 break  
                 
             except errors.APIError as e:
                 if e.code == 429:
                     if versuch < 4:
                         countdown_placeholder = st.empty()
+                        # Falls durch vorherige Klicks noch Rest-Last auf der Leitung liegt, leeren wir sie mit 65s
                         for sekunde in range(65, -1, -1):
                             countdown_placeholder.warning(
-                                f"⏳ **Google API-Limit erreicht.** Die App wartet, bis das Zeitfenster frei wird. "
+                                f"⏳ **Google API-Limit erreicht.** Die App regeneriert die Verbindung. "
                                 f"Weiter in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
                             )
                             time.sleep(1)
                         countdown_placeholder.empty()
                         continue
                 st.error(f"⚠️ Kritischer API-Fehler (Code {e.code}): {e.message}")
-                return np.array([]) # Gibt bei echtem Fehler leeres Array zurück
+                return np.array([])
             except Exception as e:
                 st.error(f"⚠️ Unerwarteter Fehler: {e}")
                 return np.array([])
             
     return np.array(embeddings)
+
 
 # --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
