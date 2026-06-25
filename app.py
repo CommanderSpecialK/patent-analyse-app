@@ -175,59 +175,26 @@ if check_password():
 
 
     # =========================================================================
-    # REITER 2: LIVE-RECHERCHE (JETZT MIT UNLIMITIERTEM OPENALEX BULK-DOWNLOAD)
+    # REITER 2: LIVE-RECHERCHE (OPENALEX)
     # =========================================================================
     with tab_suche:
-        st.title("🔍 Unlimitierte Live-Recherche & KI-Massenfilter")
-        st.write("Durchsucht Millionen von weltweiten Patenten über OpenAlex in Sekundenschnelle ohne API-Limits.")
+        st.title("🔍 Live-Recherche & Massen-Filter")
+        st.write("Durchsuche die weltweite OpenAlex-Datenbank nach Patenten und filtere sie live per Gemini-Semantik.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            query_input = st.text_input("Suchbegriff für OpenAlex (z.B. 'Solid state battery')", "Solid state battery")
+            max_res = st.slider("Maximale Treffer von OpenAlex", 10, 200, 50, step=10)
+        with col2:
+            criterion_input = st.text_input("KI-Filter-Kriterium (Worauf soll geprüft werden?)", "Anode materials made of silicon")
+            score_threshold_suche = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 50, key="slider2")
+            
+        if st.button("Recherche & KI-Analyse starten"):
+            with st.spinner("Frage OpenAlex ab und berechne Gemini-Relevanz..."):
+                daten = search_openalex_patents(query_input, criterion_input, score_threshold_suche, max_results=max_res)
+                if daten:
+                    st.success(f"{len(daten)} relevante Patente gefunden!")
+                    st.dataframe(pd.DataFrame(daten), use_container_width=True)
+                else:
+                    st.info("Keine Patente gefunden, die den Suchbegriffen und dem KI-Filter entsprechen.")
 
-        @st.cache_resource
-        def load_local_model_suche(): return SentenceTransformer('all-MiniLM-L6-v2')
-        model_suche = load_local_model_suche()
-
-        col_stichworte, col_kriterium = st.columns(2)
-        with col_stichworte:
-            st.subheader("1. Datenbank-Abfrage")
-            keywords_input = st.text_input("Grobe Stichworte (Englisch, z.B. `solid state battery`):", value="solid state battery")
-        with col_kriterium:
-            st.subheader("2. KI-Feinfilter (Freitext)")
-            filter_input = st.text_input("Worauf soll die KI filtern? (z.B. `anode materials or lithium metal silicon`):", value="anode materials")
-
-        # Zusätzliche Einstellungen für die Massen-Analyse
-        st.markdown("---")
-        col_slider, col_max = st.columns([3, 1])
-        with col_slider:
-            live_score_threshold = st.slider("Mindest-Übereinstimmung für Relevanz (in %)", min_value=0, max_value=100, value=25, key="slider2")
-        with col_max:
-            max_results_input = st.selectbox("Wie viele Patente scannen?", [25, 50, 100, 200], index=2)
-
-        if st.button("Massen-Suche & KI-Analyse starten"):
-            if not keywords_input or not filter_input:
-                st.error("Bitte fülle alle Textfelder aus.")
-            else:
-                with st.spinner(f"Frage OpenAlex ab und jage bis zu {max_results_input} Patente durch die KI..."):
-                    
-                    # Suche und Filterung starten
-                    analyzed_results = search_openalex_patents(keywords_input, filter_input, live_score_threshold, model_suche, max_results=max_results_input)
-                    
-                    if analyzed_results:
-                        st.success(f"Analyse blitzschnell beendet! {len(analyzed_results)} relevante Patente gefunden.")
-                        df_live_analyzed = pd.DataFrame(analyzed_results)
-                        
-                        # Tabelle formatiert anzeigen
-                        st.data_editor(
-                            df_live_analyzed,
-                            column_config={
-                                "Link zur Quelle": st.column_config.LinkColumn(
-                                    "Link zur Quelle",
-                                    display_text="↗ Patent öffnen"
-                                )
-                            },
-                            disabled=True,
-                            use_container_width=True
-                        )
-                        
-                        csv_live = df_live_analyzed.to_csv(index=False).encode('utf-8')
-                        st.download_button(label="Gefilterte Patente als CSV herunterladen", data=csv_live, file_name="openalex_ki_treffer.csv", mime="text/csv")
-                    else:
-                        st.warning("Keine Patente gefunden, die diesen KI-Score erreichen. Verändere deine Suchwörter oder senke den Mindest-Score.")
