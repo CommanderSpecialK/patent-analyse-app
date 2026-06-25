@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from sentence_transformers import SentenceTransformer
+from google import genai
+from google.genai import types
 
 # Seiteneinstellungen
 st.set_page_config(page_title="Patent Analyse Tool", layout="wide")
@@ -15,15 +16,39 @@ def check_password():
         return False
     return st.session_state["password_correct"]
 
-# --- OPENALEX API HILFSFUNKTION ---
-def search_openalex_patents(query_string, filter_criterion, score_threshold, model, max_results=100):
-    """Sucht Patente via OpenAlex (robuste Version) und jagt sie durch die KI."""
-    # Bereinigung der Suchbegriffe für die URL
+# --- GEMINI CLIENT & EMBEDDING INITIALISIERUNG ---
+@st.cache_resource
+def get_gemini_client():
+    # Nutzt automatisch st.secrets["GEMINI_API_KEY"] falls lokal/Cloud gesetzt
+    return genai.Client()
+
+def get_gemini_embeddings(texts, model_name="text-embedding-004"):
+    """Erzeugt hochpräzise Vektoren via Gemini API in Batches."""
+    client = get_gemini_client()
+    embeddings = []
+    
+    # Gemini erlaubt bis zu 2048 Texte pro Anfrage
+    batch_size = 100 
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        # Leere Texte abfangen, da die API sonst Fehler wirft
+        batch_texts = [t if str(t).strip() != "" else "Kein Text vorhanden" for t in batch_texts]
+        
+        response = client.models.embed_content(
+            model=model_name,
+            contents=batch_texts
+        )
+        # Extrahiere die mathematischen Vektoren
+        for embedding in response.embeddings:
+            embeddings.append(embedding.values)
+            
+    return np.array(embeddings)
+
+# --- OPENALEX API HILFSFUNKTION (Aktualisiert auf Gemini) ---
+def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
+    """Sucht Patente via OpenAlex und vergleicht sie mittels Gemini Embeddings."""
     clean_query = query_string.replace(" AND ", " ").replace(" OR ", " ").replace("'", "")
-    
-    # Der offizielle und sichere Such-Endpunkt von OpenAlex (gefiltert auf Typ: patent)
     url = f"https://api.openalex.org/works?search={clean_query}&filter=type:patent&per_page={max_results}"
-    
     patents_found = []
     
     try:
@@ -31,19 +56,17 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, mod
         if response.status_code == 200:
             data = response.json()
             results = data.get("results", [])
-            
-            if not results:
-                return []
+            if not results: return []
                 
-            # KI-Vektor für das gewünschte Filter-Kriterium berechnen
-            criterion_embedding = model.encode(filter_criterion, convert_to_numpy=True)
+            # Gemini Vektor für das Filter-Kriterium berechnen
+            criterion_embedding = get_gemini_embeddings([filter_criterion])[0]
+            
+            # Alle Patenttexte sammeln für performante Batch-Verarbeitung
+            patent_texts = []
+            patent_metadata = []
             
             for work in results:
-                title = work.get("title")
-                if not title:
-                    title = "Kein Titel verfügbar"
-                
-                # Extrem fehlertolerante Rekonstruktion des Abstracts
+                title = work.get("title", "Kein Titel verfügbar")
                 abstract = "Keine Zusammenfassung verfügbar"
                 abstract_inverted = work.get("abstract_inverted")
                 if abstract_inverted and isinstance(abstract_inverted, dict):
@@ -51,51 +74,40 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, mod
                         abstract_words = {}
                         for word, positions in abstract_inverted.items():
                             if positions and isinstance(positions, list):
-                                for pos in positions:
-                                    abstract_words[pos] = word
+                                for pos in positions: abstract_words[pos] = word
                         if abstract_words:
                             abstract = " ".join([abstract_words[p] for p in sorted(abstract_words.keys())])
-                    except:
-                        abstract = "Zusammenfassung konnte nicht decodiert werden"
+                    except: pass
                 
-                # Patentnummer ermitteln
                 display_name = work.get("display_name", "")
-                patent_id = "Unbekannte Nummer"
-                if display_name:
-                    patent_id = display_name.replace("Patent: ", "")
-                else:
-                    patent_id = work.get("id", "").split("/")[-1]
-
-                # Link zu Espacenet aufbauen
-                clean_num_for_link = patent_id.replace("-", "").replace(" ", "").replace("_", "")
-                espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={clean_num_for_link}"
+                patent_id = display_name.replace("Patent: ", "") if display_name else work.get("id", "").split("/")[-1]
+                espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={patent_id.replace('-', '').replace(' ', '')}"
                 
-                # --- KI ANALYSE ---
-                # Falls Abstract fehlt, nutzen wir nur den Titel, damit der Treffer nicht verloren geht!
-                patent_text = f"{title}. {abstract}"
-                patent_embedding = model.encode(patent_text, convert_to_numpy=True)
-                
-                # Cosinus-Ähnlichkeit berechnen
+                patent_texts.append(f"{title}. {abstract}")
+                patent_metadata.append({"id": patent_id, "title": title, "abstract": abstract, "url": espacenet_url})
+            
+            # Alle Patent-Vektoren auf einmal via Gemini holen
+            patent_embeddings = get_gemini_embeddings(patent_texts)
+            
+            # Ähnlichkeiten berechnen
+            for idx, patent_embedding in enumerate(patent_embeddings):
                 sim = np.dot(criterion_embedding, patent_embedding) / (np.linalg.norm(criterion_embedding) * np.linalg.norm(patent_embedding))
                 percentage_score = round(sim * 100, 1)
                 
-                # In die Liste aufnehmen
                 if percentage_score >= score_threshold:
+                    meta = patent_metadata[idx]
                     patents_found.append({
-                        "Patentnummer": patent_id,
-                        "Titel": title,
-                        "Zusammenfassung (Abstract)": abstract if len(abstract) < 150 else abstract[:150] + "...",
+                        "Patentnummer": meta["id"],
+                        "Titel": meta["title"],
+                        "Zusammenfassung (Abstract)": meta["abstract"] if len(meta["abstract"]) < 150 else meta["abstract"][:150] + "...",
                         "KI Relevanz Score": f"{percentage_score} %",
-                        "Link zur Quelle": espacenet_url,
+                        "Link zur Quelle": meta["url"],
                         "raw_score": percentage_score
                     })
             
-            # Sortieren nach Relevanz
             if patents_found:
                 df_temp = pd.DataFrame(patents_found)
-                df_temp = df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"])
-                return df_temp.to_dict('records')
-                
+                return df_temp.sort_values(by="raw_score", ascending=False).drop(columns=["raw_score"]).to_dict('records')
         return []
     except Exception as e:
         st.error(f"Fehler bei der OpenAlex-Abfrage: {e}")
@@ -106,15 +118,11 @@ if check_password():
     tab_vergleich, tab_suche = st.tabs(["📊 Patent-Listen Vergleich", "🔍 Live-Recherche (OpenAlex Massen-Filter)"])
 
     # =========================================================================
-    # REITER 1: PATENT-LISTEN VERGLEICH (TEIL 1)
+    # REITER 1: PATENT-LISTEN VERGLEICH
     # =========================================================================
     with tab_vergleich:
-        st.title("💡 Patent Analyse Tool (KI-Berechnung)")
-        st.write("Lade zwei Excel-Listen (.xlsx oder .xlsm) hoch, um sie auf technische Nähe zu prüfen.")
-
-        @st.cache_resource
-        def load_local_model(): return SentenceTransformer('all-MiniLM-L6-v2')
-        model = load_local_model()
+        st.title("💡 Patent Analyse Tool (Gemini-Power)")
+        st.write("Lade zwei Excel-Listen hoch, um sie mit modernster Gemini-Semantik zu vergleichen.")
         
         col1, col2 = st.columns(2)
         with col1: uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
@@ -129,23 +137,42 @@ if check_password():
         df_own = load_patent_data(uploaded_file_own)
 
         if df_ext is not None and df_own is not None:
-            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 30, key="slider1")
+            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 60, key="slider1") # Höherer Standard-Wert, da Gemini präziser trennt
             if st.button("Semantische Nähe berechnen"):
-                with st.spinner("Analyse läuft..."):
+                with st.spinner("Gemini analysiert die Patente... Bitte warten."):
+                    
+                    # Texte vorbereiten
                     texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
                     texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                    emb_ext = model.encode(texts_ext, convert_to_numpy=True)
-                    emb_own = model.encode(texts_own, convert_to_numpy=True)
+                    
+                    # Embeddings über Gemini API abrufen
+                    emb_ext = get_gemini_embeddings(texts_ext)
+                    emb_own = get_gemini_embeddings(texts_own)
+                    
                     results = []
                     for idx_ext, e_ext in enumerate(emb_ext):
                         best_score = 0
                         best_id, best_title = "", ""
                         for idx_own, e_own in enumerate(emb_own):
                             sim = np.dot(e_ext, e_own) / (np.linalg.norm(e_ext) * np.linalg.norm(e_own))
-                            if sim > best_score: best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
-                        if round(best_score * 100, 1) >= score_threshold:
-                            results.append({"Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], "Ähnlichstes eigenes Patent": best_id, "Titel (Eigen)": best_title, "Match Score": f"{round(best_score * 100, 1)} %"})
-                    if results: st.dataframe(pd.DataFrame(results), use_container_width=True)
+                            if sim > best_score: 
+                                best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
+                        
+                        score_percent = round(best_score * 100, 1)
+                        if score_percent >= score_threshold:
+                            results.append({
+                                "Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], 
+                                "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], 
+                                "Ähnlichstes eigenes Patent": best_id, 
+                                "Titel (Eigen)": best_title, 
+                                "Match Score": f"{score_percent} %"
+                            })
+                            
+                    if results: 
+                        st.dataframe(pd.DataFrame(results), use_container_width=True)
+                    else:
+                        st.info("Keine Patente über dem gewählten Mindest-Score gefunden.")
+
 
     # =========================================================================
     # REITER 2: LIVE-RECHERCHE (JETZT MIT UNLIMITIERTEM OPENALEX BULK-DOWNLOAD)
