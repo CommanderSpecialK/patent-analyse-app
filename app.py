@@ -25,9 +25,8 @@ def get_gemini_client():
     api_key = st.secrets["GEMINI_API_KEY"].strip().strip('"').strip("'")
     return genai.Client(api_key=api_key)
 
-# --- GEMINI EMBEDDING BERECHNUNG (Extrem defensiv gegen 429) ---
+# --- GEMINI EMBEDDING BERECHNUNG (Strikt mathematisch gedrosselt) ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
-    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung des 1000-Texte-Limits."""
     if not texts:
         return np.array([])
         
@@ -36,8 +35,8 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         return np.array([])
         
     embeddings = []
-    # Auf 10 reduziert, damit wir die Last perfekt über die Zeit verteilen
-    batch_size = 10 
+    # 50 Texte pro Paket
+    batch_size = 50 
     
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
@@ -52,32 +51,30 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Feste Pause von 1,0 Sekunde nach 10 Texten = Konstant max. 600 Texte/Minute.
-                # Das reißt das Google-Limit (1.000) mathematisch garantiert niemals!
-                time.sleep(2.0)
+                # 3,5 Sekunden Pause nach 50 Texten = ca. 850 Texte/Minute.
+                # Damit bleiben wir mathematisch IMMER unter dem 1.000er-Limit!
+                time.sleep(3.5)
                 break  
                 
             except errors.APIError as e:
                 if e.code == 429:
                     if versuch < 4:
                         countdown_placeholder = st.empty()
-                        # Falls durch vorherige Versuche noch Rest-Last da ist, fangen wir sie mit 65s ab
                         for sekunde in range(65, -1, -1):
                             countdown_placeholder.warning(
-                                f"⏳ **Google API-Limit erreicht.** Die App regeneriert die Verbindung. "
+                                f"⏳ **Google API-Limit erreicht.** Die App wartet, bis das Zeitfenster frei wird. "
                                 f"Weiter in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
                             )
                             time.sleep(1)
                         countdown_placeholder.empty()
                         continue
                 st.error(f"⚠️ Kritischer API-Fehler (Code {e.code}): {e.message}")
-                return np.array([])
+                return np.array([]) # Gibt bei echtem Fehler leeres Array zurück
             except Exception as e:
                 st.error(f"⚠️ Unerwarteter Fehler: {e}")
                 return np.array([])
             
     return np.array(embeddings)
-
 
 # --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
@@ -90,7 +87,7 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, max
         if response.status_code == 200:
             data = response.json()
             results = data.get("results", [])
-            if not results: return []
+            if not map: return []
                 
             criterion_embeddings = get_gemini_embeddings([filter_criterion])
             if criterion_embeddings.size == 0: return []
@@ -153,14 +150,12 @@ if check_password():
     # REITER 1: PATENT-LISTEN VERGLEICH
     # =========================================================================
     with tab_vergleich:
-        st.title("💡 Patent Analyse Tool (Gemini Vektor-Cache)")
-        st.write("Lade zwei Excel-Listen hoch. Die berechneten Vektoren werden sicher im Session-Speicher abgelegt.")
+        st.title("💡 Patent Analyse Tool (Zweistufiger Vektor-Schutz)")
+        st.write("Lade zwei Excel-Listen hoch. Die Schritte sind getrennt, um Google-Limits (429) im kostenlosen Tarif strikt zu vermeiden.")
         
         col1, col2 = st.columns(2)
-        with col1: 
-            uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
-        with col2: 
-            uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
+        with col1: uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
+        with col2: uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
         
         def load_patent_data(f):
             if f is not None:
@@ -175,84 +170,36 @@ if check_password():
         if df_ext is not None and df_own is not None:
             score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 60, key="slider1")
             
-            # Button zum Zurücksetzen des Speichers bei neuen Listen
-            if st.button("🔄 Cache löschen (für neue Dateien)"):
-                if "emb_ext" in st.session_state: 
-                    del st.session_state["emb_ext"]
-                if "emb_own" in st.session_state: 
-                    del st.session_state["emb_own"]
-                st.success("Speicher gelöscht! Du kannst jetzt neue Dateien berechnen.")
+            # Speicher im Session State sauber initialisieren
+            if "emb_ext" not in st.session_state: st.session_state["emb_ext"] = None
+            if "emb_own" not in st.session_state: st.session_state["emb_own"] = None
 
-            if st.button("Semantische Nähe berechnen"):
-                status_text = st.empty()
-                
-                # --- LISTE 1 BERECHNEN ODER AUS DEM SPEICHER LADEN ---
-                if "emb_ext" not in st.session_state:
-                    status_text.info("1/2: Hole Gemini-Vektoren für die externe Liste...")
-                    texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                    st.session_state["emb_ext"] = get_gemini_embeddings(texts_ext)
-                else:
-                    st.sidebar.success("✅ Externe Vektoren aus Speicher geladen.")
-                
-                # Sicherheits-Pause nach Liste 1, falls Liste 2 noch berechnet werden muss
-                if "emb_own" not in st.session_state:
-                    countdown_placeholder = st.empty()
-                    for sekunde in range(65, -1, -1):
-                        countdown_placeholder.warning(f"⏳ Bereite Liste 2 vor. Google-Schutz-Pause: **{sekunde} Sekunden**...")
-                        time.sleep(1)
-                    countdown_placeholder.empty()
-                    
-                    status_text.info("2/2: Hole Gemini-Vektoren für die eigene Liste...")
-                    texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                    st.session_state["emb_own"] = get_gemini_embeddings(texts_own)
-                else:
-                    st.sidebar.success("✅ Eigene Vektoren aus Speicher geladen.")
-                
-                emb_ext = st.session_state["emb_ext"]
-                emb_own = st.session_state["emb_own"]
-                
-                if emb_ext.size > 0 and emb_own.size > 0:
-                    status_text.info("⚡ Berechne Ähnlichkeits-Matrix... Bitte warten.")
-                    
-                    # Vektoren normalisieren für Kosinus-Ähnlichkeit
-                    norm_ext = emb_ext / np.linalg.norm(emb_ext, axis=1, keepdims=True)
-                    norm_own = emb_own / np.linalg.norm(emb_own, axis=1, keepdims=True)
-                    
-                    # Blitzschnelle Matrix-Multiplikation statt langsamer Python-Schleifen
-                    similarity_matrix = np.dot(norm_ext, norm_own.T)
-                    best_own_indices = np.argmax(similarity_matrix, axis=1)
-                    best_scores = np.max(similarity_matrix, axis=1)
-                    
-                    results = []
-                    for idx_ext, best_idx_own in enumerate(best_own_indices):
-                        score_percent = round(best_scores[idx_ext] * 100, 1)
-                        if score_percent >= score_threshold:
-                            results.append({
-                                "Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], 
-                                "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], 
-                                "Ähnlichstes eigenes Patent": df_own.iloc[best_idx_own]['Patentnummer'], 
-                                "Titel (Eigen)": df_own.iloc[best_idx_own]['Titel_Uebersetzt'], 
-                                "Match Score": f"{score_percent} %"
-                            })
-                            
-                    status_text.empty()
-                    
-                    if results: 
-                        # Ergebnisse nach dem Match Score abwärts sortieren
-                        df_res = pd.DataFrame(results)
-                        df_res['sort_val'] = df_res['Match Score'].str.replace(' %', '').astype(float)
-                        df_res = df_res.sort_values(by='sort_val', ascending=False).drop(columns=['sort_val'])
+            # Statusanzeige im Sidebar-Bereich
+            st.sidebar.markdown("### 📈 Analyse-Status")
+            status_ext_msg = "❌ Noch nicht berechnet" if st.session_state["emb_ext"] is None else "✅ Fertig im Speicher"
+            status_own_msg = "❌ Noch nicht berechnet" if st.session_state["emb_own"] is None else "✅ Fertig im Speicher"
+            st.sidebar.write(f"**Externe Liste:** {status_ext_msg}")
+            st.sidebar.write(f"**Eigene Liste:** {status_own_msg}")
+
+            if st.sidebar.button("🔄 Gesamten Cache löschen"):
+                st.session_state["emb_ext"] = None
+                st.session_state["emb_own"] = None
+                st.rerun()
+
+            # --- SCHRITT 1: EXTERNE LISTE ---
+            if st.session_state["emb_ext"] is None:
+                st.info("👉 **Schritt 1:** Klicke zuerst hier, um die externe Liste einzulesen.")
+                if st.button("▶️ Schritt 1: Externe Liste verarbeiten"):
+                    with st.spinner("Hole Gemini-Vektoren für die externe Liste..."):
+                        texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                        temp_emb = get_gemini_embeddings(texts_ext)
                         
-                        st.success(f"Analyse erfolgreich abgeschlossen! {len(df_res)} Treffer gefunden.")
-                        st.dataframe(df_res, use_container_width=True)
-                    else:
-                        st.info("Keine Patente über dem gewählten Mindest-Score gefunden.")
-                else:
-                    status_text.empty()
-                    st.error("Fehler beim Erzeugen der Vektoren. Falls der Fehler anhält, klicke oben auf 'Cache löschen'.")
-
-
-
+                        # Absicherung: Nur speichern, wenn die Berechnung fehlerfrei geklappt hat!
+                        if temp_emb.size > 0:
+                            st.session_state["emb_ext"] = temp_emb
+                            st.rerun()
+                        else:
+                            st.error("❌ Schritt 1 abgebrochen wegen eines API-Fehlers. Bitte kurz warten und erneut versuchen.")
 
 
     # =========================================================================
