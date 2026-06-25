@@ -196,7 +196,7 @@ if check_password():
             if st.sidebar.button("🔄 Gesamten Cache löschen"):
                 st.session_state["emb_ext"] = None
                 st.session_state["emb_own"] = None
-                st.experimental_rerun()
+                st.rerun()
 
             # --- SCHRITT 1: EXTERNE LISTE ---
             if st.session_state["emb_ext"] is None:
