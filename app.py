@@ -4,7 +4,6 @@ import numpy as np
 import requests
 import time
 from google import genai
-from google.genai import types
 from google.genai import errors
 
 # Seiteneinstellungen
@@ -19,6 +18,16 @@ def check_password():
     return st.session_state["password_correct"]
 
 # --- GEMINI CLIENT INITIALISIERUNG ---
+def get_gemini_client():
+    """Holt den Key explizit aus Streamlit Secrets und initialisiert den Client."""
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error("❌ Der GEMINI_API_KEY fehlt in den Streamlit Secrets!")
+        return None
+    
+    api_key = st.secrets["GEMINI_API_KEY"].strip().strip('"').strip("'")
+    return genai.Client(api_key=api_key)
+
+# --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
     """Erzeugt hochpräzise Vektoren via Gemini API mit robustem Quoten-Schutz und Live-Countdown."""
     if not texts:
@@ -76,16 +85,11 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
             
     return np.array(embeddings)
 
-
-
-
-
-
-# --- OPENALEX API HILFSFUNKTION (Aktualisiert auf Gemini) ---
+# --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
     """Sucht Patente via OpenAlex und vergleicht sie mittels Gemini Embeddings."""
     clean_query = query_string.replace(" AND ", " ").replace(" OR ", " ").replace("'", "")
-    url = f"https://api.openalex.org/works?search={clean_query}&filter=type:patent&per_page={max_results}"
+    url = f"https://openalex.org{clean_query}&filter=type:patent&per_page={max_results}"
     patents_found = []
     
     try:
@@ -93,12 +97,15 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, max
         if response.status_code == 200:
             data = response.json()
             results = data.get("results", [])
-            if not results: return []
+            if not results: 
+                return []
                 
             # Gemini Vektor für das Filter-Kriterium berechnen
-            criterion_embedding = get_gemini_embeddings([filter_criterion])[0]
+            criterion_embeddings = get_gemini_embeddings([filter_criterion])
+            if criterion_embeddings.size == 0:
+                return []
+            criterion_embedding = criterion_embeddings[0]
             
-            # Alle Patenttexte sammeln für performante Batch-Verarbeitung
             patent_texts = []
             patent_metadata = []
             
@@ -111,20 +118,24 @@ def search_openalex_patents(query_string, filter_criterion, score_threshold, max
                         abstract_words = {}
                         for word, positions in abstract_inverted.items():
                             if positions and isinstance(positions, list):
-                                for pos in positions: abstract_words[pos] = word
+                                for pos in positions: 
+                                    abstract_words[pos] = word
                         if abstract_words:
                             abstract = " ".join([abstract_words[p] for p in sorted(abstract_words.keys())])
-                    except: pass
+                    except: 
+                        pass
                 
                 display_name = work.get("display_name", "")
                 patent_id = display_name.replace("Patent: ", "") if display_name else work.get("id", "").split("/")[-1]
-                espacenet_url = f"https://worldwide.espacenet.com/patent/search?q={patent_id.replace('-', '').replace(' ', '')}"
+                espacenet_url = f"https://espacenet.com{patent_id.replace('-', '').replace(' ', '')}"
                 
                 patent_texts.append(f"{title}. {abstract}")
                 patent_metadata.append({"id": patent_id, "title": title, "abstract": abstract, "url": espacenet_url})
             
             # Alle Patent-Vektoren auf einmal via Gemini holen
             patent_embeddings = get_gemini_embeddings(patent_texts)
+            if patent_embeddings.size == 0:
+                return []
             
             # Ähnlichkeiten berechnen
             for idx, patent_embedding in enumerate(patent_embeddings):
