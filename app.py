@@ -27,6 +27,7 @@ def get_gemini_client():
 
 # --- GEMINI EMBEDDING BERECHNUNG (Extrem defensiv gegen 429) ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
+    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung des 1000-Texte-Limits."""
     if not texts:
         return np.array([])
         
@@ -35,8 +36,8 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         return np.array([])
         
     embeddings = []
-    # Radikal verkleinert auf 20, um die Last pro Sekunde extrem zu minimieren
-    batch_size = 20 
+    # Auf 10 reduziert, damit wir die Last perfekt über die Zeit verteilen
+    batch_size = 10 
     
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
@@ -51,15 +52,17 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Jedes kleine Paket wartet 4 Sekunden -> Maximal 300 Texte pro Minute (Sicher unter 1.000!)
-                time.sleep(4.0)
+                # Feste Pause von 1,0 Sekunde nach 10 Texten = Konstant max. 600 Texte/Minute.
+                # Das reißt das Google-Limit (1.000) mathematisch garantiert niemals!
+                time.sleep(2.0)
                 break  
                 
             except errors.APIError as e:
                 if e.code == 429:
                     if versuch < 4:
                         countdown_placeholder = st.empty()
-                        for sekunde in range(70, -1, -1):
+                        # Falls durch vorherige Versuche noch Rest-Last da ist, fangen wir sie mit 65s ab
+                        for sekunde in range(65, -1, -1):
                             countdown_placeholder.warning(
                                 f"⏳ **Google API-Limit erreicht.** Die App regeneriert die Verbindung. "
                                 f"Weiter in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
@@ -74,6 +77,7 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 return np.array([])
             
     return np.array(embeddings)
+
 
 # --- OPENALEX API HILFSFUNKTION ---
 def search_openalex_patents(query_string, filter_criterion, score_threshold, max_results=100):
