@@ -19,8 +19,10 @@ def check_password():
 # --- GEMINI CLIENT & EMBEDDING INITIALISIERUNG ---
 @st.cache_resource
 def get_gemini_client():
-    # Nutzt automatisch st.secrets["GEMINI_API_KEY"] falls lokal/Cloud gesetzt
-    return genai.Client()
+    # Holt den Key explizit aus den Streamlit Secrets
+    api_key = st.secrets["GEMINI_API_KEY"]
+    return genai.Client(api_key=api_key)
+
 
 def get_gemini_embeddings(texts, model_name="text-embedding-004"):
     """Erzeugt hochpräzise Vektoren via Gemini API in Batches."""
