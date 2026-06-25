@@ -208,7 +208,7 @@ if check_password():
                         if temp_emb.size > 0:
                             st.session_state["emb_ext"] = temp_emb
                             st.success("🎉 Externe Liste erfolgreich verarbeitet!")
-                            st.experimental_rerun()
+                            st.rerun()
                         else:
                             st.error("❌ Fehler bei der Berechnung von Liste 1.")
             # --- SCHRITT 2: EIGENE LISTE ---
@@ -221,7 +221,7 @@ if check_password():
                         if temp_emb_own.size > 0:
                             st.session_state["emb_own"] = temp_emb_own
                             st.success("🎉 Eigene Liste erfolgreich verarbeitet!")
-                            st.experimental_rerun()
+                            st.rerun()
                         else:
                             st.error("❌ Fehler bei der Berechnung von Liste 2.")
 
