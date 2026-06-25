@@ -29,7 +29,7 @@ def get_gemini_client():
 
 # --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
-    """Erzeugt hochpräzise Vektoren via Gemini API mit automatischem Quoten-Schutz."""
+    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung aller API-Limits."""
     if not texts:
         return np.array([])
         
@@ -38,14 +38,13 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
         return np.array([])
         
     embeddings = []
-    # Erhöht auf 1000 Texte pro Anfrage, um die Anzahl der Requests massiv zu senken
-    batch_size = 1000 
+    # Strikt auf 100 gesetzt, da Google exakt maximal 100 Texte pro Anfrage erlaubt
+    batch_size = 100 
     
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
         batch_texts = [str(t).strip() if str(t).strip() != "" else "Kein Text vorhanden" for t in batch_texts]
         
-        # Bis zu 3 Versuche pro Batch, falls wir in ein Zeitlimit laufen
         for versuch in range(3):
             try:
                 response = client.models.embed_content(
@@ -55,22 +54,24 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Kurze Pause nach jedem erfolgreichen Riesen-Batch zum Schutz vor Quoten-Limits
-                time.sleep(1.0)
-                break  # Erfolgreich, bricht die Versuchsschleife ab
+                # Feste Pause von 1,2 Sekunden nach jedem 100er-Block. 
+                # Das verhindert, dass wir die 100 Anfragen pro Minute im Free Tier reißen.
+                time.sleep(1.2)
+                break  
                 
             except Exception as e:
-                # Wenn wir das Limit (429) erreichen, warten wir und versuchen es erneut
+                # Automatisches Sicherheitsnetz für das 429-Minuten-Limit
                 if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                     if versuch < 2:
-                        st.warning(f"⏳ Google-Limit erreicht. Warte 15 Sekunden (Versuch {versuch+1}/3)...")
-                        time.sleep(15)
+                        st.warning(f"⏳ Minuten-Limit fast erreicht. Warte 20 Sekunden zur Entlastung (Versuch {versuch+1}/3)...")
+                        time.sleep(20)
                         continue
                 
                 st.error(f"⚠️ Kritischer Fehler bei der Gemini-API-Abfrage: {e}")
                 return np.array([])
             
     return np.array(embeddings)
+
 
 
 
