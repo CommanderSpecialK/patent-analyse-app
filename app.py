@@ -29,7 +29,7 @@ def get_gemini_client():
 
 # --- GEMINI EMBEDDING BERECHNUNG ---
 def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
-    """Erzeugt hochpräzise Vektoren via Gemini API mit robustem Quoten-Schutz und Live-Countdown."""
+    """Erzeugt hochpräzise Vektoren via Gemini API unter strikter Einhaltung des 1000-Texte-Limits."""
     if not texts:
         return np.array([])
         
@@ -53,8 +53,8 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 for embedding in response.embeddings:
                     embeddings.append(embedding.values)
                 
-                # Erhöht auf 3.5 Sekunden, um unter dem Limit von 1.000 Texten/Minute zu bleiben
-                time.sleep(3.5)
+                # Feste Pause zwischen den 100er-Blöcken
+                time.sleep(6.2)
                 break  
                 
             except errors.APIError as e:
@@ -62,14 +62,14 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                     if versuch < 4:
                         countdown_placeholder = st.empty()
                         
-                        # Erhöht auf 65 Sekunden, damit das Rolling Window bei Google sicher abläuft
-                        for sekunde in range(65, -1, -1):
+                        # Da das Limit nur minimal überschritten wurde, reichen oft kurze Pausen.
+                        # Wir warten hier sicherheitshalber 20 Sekunden, um die Quote zu leeren.
+                        for sekunde in range(20, -1, -1):
                             countdown_placeholder.warning(
-                                f"⏳ **Google API-Limit (1.000 Texte/Min) erreicht.** Die App pausiert kurz zur Entlastung. "
+                                f"⏳ **Google API-Limit kurzzeitig erreicht.** Die App pausiert kurz zur Entlastung. "
                                 f"Weiter geht es automatisch in **{sekunde} Sekunden**... (Versuch {versuch+1}/5)"
                             )
                             time.sleep(1)
-                        
                         countdown_placeholder.empty()
                         continue
                 
@@ -81,6 +81,7 @@ def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
                 return np.array([])
             
     return np.array(embeddings)
+
 
 
 # --- OPENALEX API HILFSFUNKTION ---
