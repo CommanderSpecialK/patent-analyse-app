@@ -190,11 +190,22 @@ if check_password():
             score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 60, key="slider1")
             if st.button("Semantische Nähe berechnen"):
                 
-                # Fortschrittsanzeige für die API-Abfragen
                 status_text = st.empty()
                 status_text.info("1/2: Hole Gemini-Vektoren für die externe Liste...")
                 texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
                 emb_ext = get_gemini_embeddings(texts_ext)
+                
+                # --- STRATEGIE-ÄNDERUNG: DIE GROSSE ZWISCHENPAUSE ---
+                if emb_ext.size > 0:
+                    countdown_placeholder = st.empty()
+                    # Wir warten volle 65 Sekunden, damit das Rolling Window bei Google für Liste 2 komplett leer ist
+                    for sekunde in range(65, -1, -1):
+                        countdown_placeholder.warning(
+                            f"⏳ **Externe Liste fertig verarbeitet.** Um das kostenlose Google-Limit für Liste 2 "
+                            f"zurückzusetzen, pausiert die App kurz. Weiter in **{sekunde} Sekunden**..."
+                        )
+                        time.sleep(1)
+                    countdown_placeholder.empty()
                 
                 status_text.info("2/2: Hole Gemini-Vektoren für die eigene Liste...")
                 texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
@@ -203,15 +214,11 @@ if check_password():
                 if emb_ext.size > 0 and emb_own.size > 0:
                     status_text.info("⚡ Berechne Ähnlichkeits-Matrix... Bitte warten.")
                     
-                    # --- BLITZSCHNELLE MATRIX-BERECHNUNG STATT SCHLEIFEN ---
-                    # Normalisiere die Vektoren für Kosinus-Ähnlichkeit
                     norm_ext = emb_ext / np.linalg.norm(emb_ext, axis=1, keepdims=True)
                     norm_own = emb_own / np.linalg.norm(emb_own, axis=1, keepdims=True)
                     
-                    # Berechne alle Ähnlichkeiten auf einmal (Matrix-Multiplikation)
                     similarity_matrix = np.dot(norm_ext, norm_own.T)
                     
-                    # Finde die jeweils beste Übereinstimmung (höchster Score pro Zeile)
                     best_own_indices = np.argmax(similarity_matrix, axis=1)
                     best_scores = np.max(similarity_matrix, axis=1)
                     
@@ -228,7 +235,7 @@ if check_password():
                                 "Match Score": f"{score_percent} %"
                             })
                             
-                    status_text.empty() # Status-Meldung löschen
+                    status_text.empty()
                     
                     if results: 
                         st.success(f"Analyse erfolgreich abgeschlossen! {len(results)} Treffer gefunden.")
@@ -238,6 +245,7 @@ if check_password():
                 else:
                     status_text.empty()
                     st.error("Fehler beim Erzeugen der Text-Vektoren. Bitte API-Key prüfen.")
+
 
 
 
