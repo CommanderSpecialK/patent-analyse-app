@@ -172,8 +172,10 @@ if check_password():
         st.write("Lade zwei Excel-Listen hoch, um sie mit modernster Gemini-Semantik zu vergleichen.")
         
         col1, col2 = st.columns(2)
-        with col1: uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
-        with col2: uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
+        with col1: 
+            uploaded_file_ext = st.file_uploader("Excel-Liste hochladen (Extern)", type=["xlsx", "xlsm"])
+        with col2: 
+            uploaded_file_own = st.file_uploader("Excel-Liste hochladen (Eigene)", type=["xlsx", "xlsm"])
         
         def load_patent_data(f):
             if f is not None:
@@ -184,41 +186,58 @@ if check_password():
         df_own = load_patent_data(uploaded_file_own)
 
         if df_ext is not None and df_own is not None:
-            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 60, key="slider1") # Höherer Standard-Wert, da Gemini präziser trennt
+            score_threshold = st.slider("Mindest-Score für Relevanz (in %)", 0, 100, 60, key="slider1")
             if st.button("Semantische Nähe berechnen"):
-                with st.spinner("Gemini analysiert die Patente... Bitte warten."):
+                
+                # Fortschrittsanzeige für die API-Abfragen
+                status_text = st.empty()
+                status_text.info("1/2: Hole Gemini-Vektoren für die externe Liste...")
+                texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                emb_ext = get_gemini_embeddings(texts_ext)
+                
+                status_text.info("2/2: Hole Gemini-Vektoren für die eigene Liste...")
+                texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                emb_own = get_gemini_embeddings(texts_own)
+                
+                if emb_ext.size > 0 and emb_own.size > 0:
+                    status_text.info("⚡ Berechne Ähnlichkeits-Matrix... Bitte warten.")
                     
-                    # Texte vorbereiten
-                    texts_ext = (df_ext['Titel_Uebersetzt'].astype(str) + " " + df_ext['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
-                    texts_own = (df_own['Titel_Uebersetzt'].astype(str) + " " + df_own['Zusammenfassung_Uebersetzt'].astype(str)).tolist()
+                    # --- BLITZSCHNELLE MATRIX-BERECHNUNG STATT SCHLEIFEN ---
+                    # Normalisiere die Vektoren für Kosinus-Ähnlichkeit
+                    norm_ext = emb_ext / np.linalg.norm(emb_ext, axis=1, keepdims=True)
+                    norm_own = emb_own / np.linalg.norm(emb_own, axis=1, keepdims=True)
                     
-                    # Embeddings über Gemini API abrufen
-                    emb_ext = get_gemini_embeddings(texts_ext)
-                    emb_own = get_gemini_embeddings(texts_own)
+                    # Berechne alle Ähnlichkeiten auf einmal (Matrix-Multiplikation)
+                    similarity_matrix = np.dot(norm_ext, norm_own.T)
+                    
+                    # Finde die jeweils beste Übereinstimmung (höchster Score pro Zeile)
+                    best_own_indices = np.argmax(similarity_matrix, axis=1)
+                    best_scores = np.max(similarity_matrix, axis=1)
                     
                     results = []
-                    for idx_ext, e_ext in enumerate(emb_ext):
-                        best_score = 0
-                        best_id, best_title = "", ""
-                        for idx_own, e_own in enumerate(emb_own):
-                            sim = np.dot(e_ext, e_own) / (np.linalg.norm(e_ext) * np.linalg.norm(e_own))
-                            if sim > best_score: 
-                                best_score, best_id, best_title = sim, df_own.iloc[idx_own]['Patentnummer'], df_own.iloc[idx_own]['Titel_Uebersetzt']
+                    for idx_ext, best_idx_own in enumerate(best_own_indices):
+                        score_percent = round(best_scores[idx_ext] * 100, 1)
                         
-                        score_percent = round(best_score * 100, 1)
                         if score_percent >= score_threshold:
                             results.append({
                                 "Externes Patent": df_ext.iloc[idx_ext]['Patentnummer'], 
                                 "Titel (Extern)": df_ext.iloc[idx_ext]['Titel_Uebersetzt'], 
-                                "Ähnlichstes eigenes Patent": best_id, 
-                                "Titel (Eigen)": best_title, 
+                                "Ähnlichstes eigenes Patent": df_own.iloc[best_idx_own]['Patentnummer'], 
+                                "Titel (Eigen)": df_own.iloc[best_idx_own]['Titel_Uebersetzt'], 
                                 "Match Score": f"{score_percent} %"
                             })
                             
+                    status_text.empty() # Status-Meldung löschen
+                    
                     if results: 
+                        st.success(f"Analyse erfolgreich abgeschlossen! {len(results)} Treffer gefunden.")
                         st.dataframe(pd.DataFrame(results), use_container_width=True)
                     else:
                         st.info("Keine Patente über dem gewählten Mindest-Score gefunden.")
+                else:
+                    status_text.empty()
+                    st.error("Fehler beim Erzeugen der Text-Vektoren. Bitte API-Key prüfen.")
+
 
 
     # =========================================================================
