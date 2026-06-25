@@ -29,7 +29,7 @@ def get_gemini_client():
     # Für die neuen AQ.-Schlüssel übergeben wir den Key direkt als API-Key Parameter
     return genai.Client(api_key=api_key)
 
-def get_gemini_embeddings(texts, model_name="text-embedding-004"):
+def get_gemini_embeddings(texts, model_name="gemini-embedding-001"):
     """Erzeugt hochpräzise Vektoren via Gemini API in Batches."""
     if not texts:
         return np.array([])
